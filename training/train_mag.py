@@ -137,34 +137,35 @@ class MemoryMAGDataset(Dataset):
         # Get input and target
         input_text = sample["input"]
         target_text = sample["target"]
-        
-        # Tokenize
-        # For causal LM, we concatenate input and target
-        full_text = input_text + " " + target_text
-        
-        encoding = self.tokenizer(
-            full_text,
-            truncation=True,
-            max_length=self.max_seq_length,
-            return_tensors="pt",
-        )
-        
-        input_ids = encoding["input_ids"].squeeze(0)
-        attention_mask = encoding["attention_mask"].squeeze(0)
-        
-        # Create labels (shifted by 1 for causal LM)
-        labels = input_ids.clone()
-        
-        # Mask input portion (only compute loss on target)
-        input_encoding = self.tokenizer(
-            input_text,
-            truncation=True,
-            max_length=self.max_seq_length,
-        )
-        input_len = len(input_encoding["input_ids"])
-        
-        # Set labels to -100 for input tokens (ignored in loss)
-        labels[:input_len] = -100
+
+        # Tokenize separately to preserve target tokens
+        input_ids = self.tokenizer(input_text, add_special_tokens=False)["input_ids"]
+        target_ids = self.tokenizer(target_text, add_special_tokens=False)["input_ids"]
+        if not target_ids:
+            target_ids = [self.tokenizer.eos_token_id]
+
+        space_ids = self.tokenizer(" ", add_special_tokens=False)["input_ids"]
+
+        available = self.max_seq_length - len(space_ids) - len(target_ids)
+        if available < 0:
+            target_keep = max(1, self.max_seq_length - len(space_ids))
+            target_ids = target_ids[:target_keep]
+            available = self.max_seq_length - len(space_ids) - len(target_ids)
+
+        if len(input_ids) > available:
+            input_ids = input_ids[-available:] if available > 0 else []
+
+        full_ids = input_ids + space_ids + target_ids
+        attention_mask = [1] * len(full_ids)
+
+        labels = [-100] * (len(input_ids) + len(space_ids)) + target_ids
+        labels = labels[:len(full_ids)]
+        if len(labels) < len(full_ids):
+            labels += [-100] * (len(full_ids) - len(labels))
+
+        input_ids = torch.tensor(full_ids, dtype=torch.long)
+        attention_mask = torch.tensor(attention_mask, dtype=torch.long)
+        labels = torch.tensor(labels, dtype=torch.long)
         
         return {
             "input_ids": input_ids,
