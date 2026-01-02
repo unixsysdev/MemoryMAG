@@ -148,6 +148,8 @@ class Qwen3MAGDecoderLayer(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ):
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
         # Get previous layer's LTM output from shared buffer (if available)
         prev_ltm_out = None
         if self.parent_model is not None and self.layer_idx > 0:
@@ -173,17 +175,8 @@ class Qwen3MAGDecoderLayer(nn.Module):
             **kwargs,
         )
 
-        attn_weights = None
-        present_key_value = None
         if isinstance(attn_outputs, tuple):
             attn_out = attn_outputs[0]
-            if output_attentions and use_cache:
-                attn_weights = attn_outputs[1] if len(attn_outputs) > 1 else None
-                present_key_value = attn_outputs[2] if len(attn_outputs) > 2 else None
-            elif output_attentions:
-                attn_weights = attn_outputs[1] if len(attn_outputs) > 1 else None
-            elif use_cache:
-                present_key_value = attn_outputs[1] if len(attn_outputs) > 1 else None
         else:
             attn_out = attn_outputs
         
@@ -212,12 +205,6 @@ class Qwen3MAGDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         
-        if output_attentions and use_cache:
-            return hidden_states, attn_weights, present_key_value
-        if output_attentions:
-            return hidden_states, attn_weights
-        if use_cache:
-            return hidden_states, present_key_value
         return hidden_states
     
     def reset_memory(self):
