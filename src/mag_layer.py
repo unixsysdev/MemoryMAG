@@ -127,6 +127,12 @@ class MAGDecoderLayer(nn.Module):
         layer_idx: int = 0,
         n_layers_total: int = 28,
         chunk_size: int = 64,
+        memory_lr: float = 0.01,
+        memory_momentum: float = 0.9,
+        memory_weight_decay: float = 0.01,
+        memory_learnable_params: bool = True,
+        memory_surprise_threshold: float = 0.0,
+        memory_max_update_norm: Optional[float] = 1.0,
     ):
         super().__init__()
         
@@ -144,7 +150,13 @@ class MAGDecoderLayer(nn.Module):
             d_model=d_model,
             d_memory=d_memory,
             n_layers=memory_layers,
+            momentum=memory_momentum,
+            lr=memory_lr,
+            weight_decay=memory_weight_decay,
+            learnable_params=memory_learnable_params,
             chunk_size=chunk_size,
+            surprise_threshold=memory_surprise_threshold,
+            max_update_norm=memory_max_update_norm,
         )
         
         # Query Projector (uses prev layer's ltm_out for refinement)
@@ -218,6 +230,7 @@ class MAGDecoderLayer(nn.Module):
         # 3. Memory retrieval and update
         ltm_out, surprise = self.neural_memory(query, update_memory=True, return_surprise=True)
         ltm_out = self.memory_norm(ltm_out)
+        ltm_out = torch.nan_to_num(ltm_out, nan=0.0, posinf=0.0, neginf=0.0)
         
         # 4. Gate mixing
         combined, gate_values = self.gate(hidden_states, attn_out, ltm_out)
@@ -258,6 +271,12 @@ class MAGModelWrapper(nn.Module):
         memory_layers: int = 2,
         n_persistent_tokens: int = 16,
         chunk_size: int = 64,
+        memory_lr: float = 0.01,
+        memory_momentum: float = 0.9,
+        memory_weight_decay: float = 0.01,
+        memory_learnable_params: bool = True,
+        memory_surprise_threshold: float = 0.0,
+        memory_max_update_norm: Optional[float] = 1.0,
         layers_to_wrap: Optional[list] = None,  # Which layers to wrap (None = all)
     ):
         super().__init__()
@@ -280,6 +299,12 @@ class MAGModelWrapper(nn.Module):
             d_memory=d_memory,
             memory_layers=memory_layers,
             chunk_size=chunk_size,
+            memory_lr=memory_lr,
+            memory_momentum=memory_momentum,
+            memory_weight_decay=memory_weight_decay,
+            memory_learnable_params=memory_learnable_params,
+            memory_surprise_threshold=memory_surprise_threshold,
+            memory_max_update_norm=memory_max_update_norm,
             layers_to_wrap=layers_to_wrap,
         )
         
@@ -288,6 +313,12 @@ class MAGModelWrapper(nn.Module):
         d_memory: Optional[int],
         memory_layers: int,
         chunk_size: int,
+        memory_lr: float,
+        memory_momentum: float,
+        memory_weight_decay: float,
+        memory_learnable_params: bool,
+        memory_surprise_threshold: float,
+        memory_max_update_norm: Optional[float],
         layers_to_wrap: Optional[list],
     ):
         """Find decoder layers in model and wrap with MAG components."""
@@ -310,6 +341,12 @@ class MAGModelWrapper(nn.Module):
                     layer_idx=idx,
                     n_layers_total=n_layers,
                     chunk_size=chunk_size,
+                    memory_lr=memory_lr,
+                    memory_momentum=memory_momentum,
+                    memory_weight_decay=memory_weight_decay,
+                    memory_learnable_params=memory_learnable_params,
+                    memory_surprise_threshold=memory_surprise_threshold,
+                    memory_max_update_norm=memory_max_update_norm,
                 )
                 self.mag_layers.append(mag_layer)
                 # Replace in original model

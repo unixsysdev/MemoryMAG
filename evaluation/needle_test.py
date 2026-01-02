@@ -190,7 +190,7 @@ class NeedleBenchmark:
         self.model.reset_all_memory()
         
         # Generate
-        output_ids = self.model.base_model.generate(
+        output_ids = self.model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,

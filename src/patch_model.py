@@ -34,6 +34,12 @@ class Qwen3MAGConfig:
         d_memory: Optional[int] = None,
         memory_layers: int = 2,
         chunk_size: int = 64,
+        memory_lr: float = 0.01,
+        memory_momentum: float = 0.9,
+        memory_weight_decay: float = 0.01,
+        memory_learnable_params: bool = True,
+        memory_surprise_threshold: float = 0.0,
+        memory_max_update_norm: Optional[float] = 1.0,
         gate_init_bias: float = -2.0,
         n_persistent_tokens: int = 16,
         layers_to_patch: Optional[List[int]] = None,
@@ -44,6 +50,12 @@ class Qwen3MAGConfig:
         self.d_memory = d_memory
         self.memory_layers = memory_layers
         self.chunk_size = chunk_size
+        self.memory_lr = memory_lr
+        self.memory_momentum = memory_momentum
+        self.memory_weight_decay = memory_weight_decay
+        self.memory_learnable_params = memory_learnable_params
+        self.memory_surprise_threshold = memory_surprise_threshold
+        self.memory_max_update_norm = memory_max_update_norm
         self.gate_init_bias = gate_init_bias
         self.n_persistent_tokens = n_persistent_tokens
         self.layers_to_patch = layers_to_patch
@@ -100,7 +112,13 @@ class Qwen3MAGDecoderLayer(nn.Module):
             d_model=d_model,
             d_memory=d_memory,
             n_layers=config.memory_layers,
+            momentum=config.memory_momentum,
+            lr=config.memory_lr,
+            weight_decay=config.memory_weight_decay,
+            learnable_params=config.memory_learnable_params,
             chunk_size=config.chunk_size,
+            surprise_threshold=config.memory_surprise_threshold,
+            max_update_norm=config.memory_max_update_norm,
         )
         
         self.query_projector = QueryProjector(
@@ -154,16 +172,27 @@ class Qwen3MAGDecoderLayer(nn.Module):
             cache_position=cache_position,
             **kwargs,
         )
-        
+
+        attn_weights = None
+        present_key_value = None
         if isinstance(attn_outputs, tuple):
             attn_out = attn_outputs[0]
+            if output_attentions and use_cache:
+                attn_weights = attn_outputs[1] if len(attn_outputs) > 1 else None
+                present_key_value = attn_outputs[2] if len(attn_outputs) > 2 else None
+            elif output_attentions:
+                attn_weights = attn_outputs[1] if len(attn_outputs) > 1 else None
+            elif use_cache:
+                present_key_value = attn_outputs[1] if len(attn_outputs) > 1 else None
         else:
             attn_out = attn_outputs
         
         # Memory path (trainable) - ensure dtype consistency
         query = self.query_projector(hidden_states, prev_ltm_out)
         ltm_out, _ = self.neural_memory(query, update_memory=True, return_surprise=True)
-        ltm_out = self.memory_norm(ltm_out).to(dtype=dtype)
+        ltm_out = self.memory_norm(ltm_out)
+        ltm_out = torch.nan_to_num(ltm_out, nan=0.0, posinf=0.0, neginf=0.0)
+        ltm_out = ltm_out.to(dtype=dtype)
         
         # Store LTM output in shared buffer for next MAG layer
         if self.parent_model is not None:
@@ -183,9 +212,12 @@ class Qwen3MAGDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         
-        # Return just hidden_states tensor (same as original Qwen3DecoderLayer)
-        # The Qwen3 model loop does: hidden_states = decoder_layer(hidden_states, ...)
-        # It expects a tensor, not a tuple
+        if output_attentions and use_cache:
+            return hidden_states, attn_weights, present_key_value
+        if output_attentions:
+            return hidden_states, attn_weights
+        if use_cache:
+            return hidden_states, present_key_value
         return hidden_states
     
     def reset_memory(self):
@@ -302,6 +334,19 @@ class Qwen3MAGModel(nn.Module):
                     device=attention_mask.device, dtype=attention_mask.dtype
                 )
                 attention_mask = torch.cat([persistent_mask, attention_mask], dim=1)
+
+            if position_ids is not None:
+                if position_ids.dim() == 1:
+                    position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+                persistent_positions = torch.arange(
+                    self.mag_config.n_persistent_tokens,
+                    device=position_ids.device,
+                    dtype=position_ids.dtype,
+                ).unsqueeze(0).expand(batch_size, -1)
+                position_ids = torch.cat(
+                    [persistent_positions, position_ids + self.mag_config.n_persistent_tokens],
+                    dim=1,
+                )
         
         outputs = self.base_model(
             inputs_embeds=inputs_embeds,
@@ -329,6 +374,94 @@ class Qwen3MAGModel(nn.Module):
             if hasattr(outputs, 'loss'):
                 outputs.loss = loss
         
+        return outputs
+
+    def _strip_persistent_from_generate(self, outputs):
+        if self.mag_config.n_persistent_tokens <= 0:
+            return outputs
+        prefix = self.mag_config.n_persistent_tokens
+        if isinstance(outputs, torch.Tensor):
+            return outputs[:, prefix:]
+        if hasattr(outputs, "sequences"):
+            outputs.sequences = outputs.sequences[:, prefix:]
+        return outputs
+
+    def _restore_input_ids_in_generate(self, outputs, input_ids):
+        if input_ids is None:
+            return outputs
+        if isinstance(outputs, torch.Tensor):
+            if outputs.shape[1] >= input_ids.shape[1]:
+                outputs[:, :input_ids.shape[1]] = input_ids.to(outputs.device)
+            return outputs
+        if hasattr(outputs, "sequences"):
+            sequences = outputs.sequences
+            if sequences.shape[1] >= input_ids.shape[1]:
+                sequences[:, :input_ids.shape[1]] = input_ids.to(sequences.device)
+            outputs.sequences = sequences
+        return outputs
+
+    def generate(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        **kwargs,
+    ):
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("generate requires input_ids or inputs_embeds")
+            if self.persistent_memory is None:
+                if position_ids is not None:
+                    kwargs["position_ids"] = position_ids
+                return self.base_model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    **kwargs,
+                )
+            embed = self.base_model.model.embed_tokens if hasattr(self.base_model, 'model') else self.base_model.embed_tokens
+            inputs_embeds = embed(input_ids)
+
+        batch_size, _, _ = inputs_embeds.shape
+        dtype = inputs_embeds.dtype
+
+        if self.persistent_memory is not None:
+            persistent = self.persistent_memory.to(dtype=dtype).expand(batch_size, -1, -1)
+            inputs_embeds = torch.cat([persistent, inputs_embeds], dim=1)
+
+            if attention_mask is not None:
+                persistent_mask = torch.ones(
+                    batch_size, self.mag_config.n_persistent_tokens,
+                    device=attention_mask.device, dtype=attention_mask.dtype
+                )
+                attention_mask = torch.cat([persistent_mask, attention_mask], dim=1)
+
+            if position_ids is not None:
+                if position_ids.dim() == 1:
+                    position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+                persistent_positions = torch.arange(
+                    self.mag_config.n_persistent_tokens,
+                    device=position_ids.device,
+                    dtype=position_ids.dtype,
+                ).unsqueeze(0).expand(batch_size, -1)
+                position_ids = torch.cat(
+                    [persistent_positions, position_ids + self.mag_config.n_persistent_tokens],
+                    dim=1,
+                )
+
+        if position_ids is not None:
+            kwargs["position_ids"] = position_ids
+
+        outputs = self.base_model.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+
+        if self.persistent_memory is not None:
+            outputs = self._strip_persistent_from_generate(outputs)
+            outputs = self._restore_input_ids_in_generate(outputs, input_ids)
+
         return outputs
     
     def reset_all_memory(self):
