@@ -52,17 +52,19 @@ class TrainingConfig:
     
     # Data
     data_path: str = "data/hash_hop_64k.jsonl"
-    max_seq_length: int = 4096  # Training sequence length
+    eval_data_path: Optional[str] = None
+    max_seq_length: int = 4096
+    max_samples: Optional[int] = None
     
     # MAG configuration
     memory_layers: int = 2
-    d_memory: Optional[int] = None  # None = 2x d_model
+    d_memory: Optional[int] = None
     n_persistent_tokens: int = 16
     chunk_size: int = 64
     
     # Training
     num_epochs: int = 3
-    batch_size: int = 1  # Usually 1 for long sequences
+    batch_size: int = 1
     gradient_accumulation_steps: int = 8
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
@@ -74,6 +76,9 @@ class TrainingConfig:
     save_steps: int = 500
     eval_steps: int = 100
     logging_steps: int = 10
+    
+    # Resume
+    resume_from: Optional[str] = None
     
     # Hardware
     device: str = "auto"
