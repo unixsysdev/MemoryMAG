@@ -291,6 +291,7 @@ class NeuralMemory(nn.Module):
         """
         batch, seq_len, d = hidden_states.shape
         device = hidden_states.device
+        dtype = hidden_states.dtype
         
         # Get current memory weights (we'll modify copies for TTT)
         current_weights = [layer.weight.clone() for layer in self.memory_layers]
@@ -337,7 +338,7 @@ class NeuralMemory(nn.Module):
             output = self.memory_forward(q, current_weights)
             outputs.append(output)
         
-        output = torch.cat(outputs, dim=1)
+        output = torch.cat(outputs, dim=1).to(dtype=dtype)
         
         if return_surprise:
             surprise = torch.cat(surprises, dim=1) if surprises else None

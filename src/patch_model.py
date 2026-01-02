@@ -120,6 +120,7 @@ class Qwen3MAGDecoderLayer(nn.Module):
         prev_ltm_out: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        dtype = hidden_states.dtype
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         
@@ -144,14 +145,14 @@ class Qwen3MAGDecoderLayer(nn.Module):
             present_key_value = None
             attn_weights = None
         
-        # Memory path (trainable)
+        # Memory path (trainable) - ensure dtype consistency
         query = self.query_projector(hidden_states, prev_ltm_out)
         ltm_out, _ = self.neural_memory(query, update_memory=True, return_surprise=True)
-        ltm_out = self.memory_norm(ltm_out)
+        ltm_out = self.memory_norm(ltm_out).to(dtype=dtype)
         
         # Gated combination
         combined, gate_values = self.gate(hidden_states, attn_out, ltm_out)
-        hidden_states = residual + combined
+        hidden_states = residual + combined.to(dtype=dtype)
         
         # MLP (frozen)
         residual = hidden_states
@@ -257,9 +258,11 @@ class Qwen3MAGModel(nn.Module):
             inputs_embeds = embed(input_ids)
         
         batch_size, seq_len, _ = inputs_embeds.shape
+        dtype = inputs_embeds.dtype
         
         if self.persistent_memory is not None:
-            persistent = self.persistent_memory.expand(batch_size, -1, -1)
+            # Ensure persistent memory matches input dtype
+            persistent = self.persistent_memory.to(dtype=dtype).expand(batch_size, -1, -1)
             inputs_embeds = torch.cat([persistent, inputs_embeds], dim=1)
             
             if attention_mask is not None:

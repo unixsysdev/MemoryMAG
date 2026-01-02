@@ -89,8 +89,12 @@ class QueryProjector(nn.Module):
             Query vectors [batch, seq, d_query]
         """
         batch, seq_len, _ = hidden_states.shape
+        dtype = hidden_states.dtype
         
         if self.use_prev_memory and prev_ltm_out is not None:
+            # Ensure prev_ltm_out matches dtype
+            prev_ltm_out = prev_ltm_out.to(dtype=dtype)
+            
             if self.combine_mode == 'concat':
                 combined = torch.cat([hidden_states, prev_ltm_out], dim=-1)
                 q = self.proj(combined)
@@ -122,8 +126,8 @@ class QueryProjector(nn.Module):
         q = self.conv(q)[:, :, :seq_len]  # Trim to original length
         q = q.transpose(1, 2)  # [batch, seq, d_query]
         
-        # Normalize
-        q = self.norm(q)
+        # Normalize and ensure dtype
+        q = self.norm(q).to(dtype=dtype)
         
         return q
 

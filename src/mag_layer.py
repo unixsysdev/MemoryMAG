@@ -66,6 +66,12 @@ class MAGGate(nn.Module):
             output: Gated mixture [batch, seq, d_model]
             gate_values: Gate activations [batch, seq, d_model] (for diagnostics)
         """
+        dtype = hidden_states.dtype
+        
+        # Ensure all inputs have same dtype
+        attn_out = attn_out.to(dtype=dtype)
+        ltm_out = ltm_out.to(dtype=dtype)
+        
         # Compute gate values
         g = torch.sigmoid(self.gate_proj(hidden_states) * self.gate_scale)
         
