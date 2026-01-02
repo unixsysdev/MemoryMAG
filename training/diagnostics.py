@@ -75,29 +75,15 @@ class MAGDiagnostics:
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
         
-        # We need to hook into the gate values
-        gate_values = {}
-        
-        def make_hook(layer_idx):
-            def hook(module, input, output):
-                if len(output) >= 3:  # output contains gate_values
-                    gate_values[layer_idx] = output[2].detach().cpu()
-            return hook
-        
-        # Register hooks
-        handles = []
-        for idx, layer in enumerate(self.mag_layers):
-            if layer is not None:
-                handle = layer.register_forward_hook(make_hook(idx))
-                handles.append(handle)
-        
-        # Forward pass
+        # Forward pass - gate values are stored in model's buffer
         self.model.reset_all_memory()
         _ = self.model(input_ids=input_ids, attention_mask=attention_mask)
         
-        # Remove hooks
-        for handle in handles:
-            handle.remove()
+        # Get gate values from the model's buffer
+        gate_values = {}
+        if hasattr(self.model, '_gate_values_buffer'):
+            for layer_idx, gates in self.model._gate_values_buffer.items():
+                gate_values[layer_idx] = gates.detach().cpu()
         
         # Analyze gate values
         results = {

@@ -61,11 +61,13 @@ class Qwen3MAGDecoderLayer(nn.Module):
         layer_idx: int,
         config: Qwen3MAGConfig,
         n_layers_total: int,
+        parent_model: Optional[nn.Module] = None,
     ):
         super().__init__()
         
         self.layer_idx = layer_idx
         self.d_model = d_model
+        self.parent_model = parent_model  # Reference to Qwen3MAGModel for LTM buffer
         
         # Copy attributes from original layer that Qwen3 expects
         if hasattr(original_layer, 'attention_type'):
@@ -117,15 +119,16 @@ class Qwen3MAGDecoderLayer(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-        prev_ltm_out: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        # Handle case where hidden_states is a tuple from a previous MAG layer
-        # Tuple format: (hidden_states, ltm_out, gate_values, [present_key_value], [attn_weights])
-        if isinstance(hidden_states, tuple):
-            if len(hidden_states) >= 2:
-                prev_ltm_out = hidden_states[1]  # Extract ltm_out from previous layer
-            hidden_states = hidden_states[0]  # Extract actual hidden states
+        # Get previous layer's LTM output from shared buffer (if available)
+        prev_ltm_out = None
+        if self.parent_model is not None and self.layer_idx > 0:
+            # Find the most recent MAG layer before this one
+            for prev_idx in range(self.layer_idx - 1, -1, -1):
+                if prev_idx in self.parent_model._ltm_buffer:
+                    prev_ltm_out = self.parent_model._ltm_buffer[prev_idx]
+                    break
         
         dtype = hidden_states.dtype
         residual = hidden_states
@@ -145,7 +148,7 @@ class Qwen3MAGDecoderLayer(nn.Module):
         
         if isinstance(attn_outputs, tuple):
             attn_out = attn_outputs[0]
-            present_key_value = attn_outputs[1] if use_cache else None
+            present_key_value = attn_outputs[1] if len(attn_outputs) > 1 else None
             attn_weights = attn_outputs[2] if output_attentions and len(attn_outputs) > 2 else None
         else:
             attn_out = attn_outputs
@@ -157,9 +160,17 @@ class Qwen3MAGDecoderLayer(nn.Module):
         ltm_out, _ = self.neural_memory(query, update_memory=True, return_surprise=True)
         ltm_out = self.memory_norm(ltm_out).to(dtype=dtype)
         
+        # Store LTM output in shared buffer for next MAG layer
+        if self.parent_model is not None:
+            self.parent_model._ltm_buffer[self.layer_idx] = ltm_out
+        
         # Gated combination
         combined, gate_values = self.gate(hidden_states, attn_out, ltm_out)
         hidden_states = residual + combined.to(dtype=dtype)
+        
+        # Store gate values for diagnostics
+        if self.parent_model is not None:
+            self.parent_model._gate_values_buffer[self.layer_idx] = gate_values
         
         # MLP (frozen)
         residual = hidden_states
@@ -167,7 +178,9 @@ class Qwen3MAGDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         
-        outputs = (hidden_states, ltm_out, gate_values)
+        # Return in standard HuggingFace format (same as original Qwen3DecoderLayer)
+        # This ensures compatibility with non-patched layers and gradient checkpointing
+        outputs = (hidden_states,)
         if use_cache:
             outputs = outputs + (present_key_value,)
         if output_attentions:
@@ -204,6 +217,12 @@ class Qwen3MAGModel(nn.Module):
         else:
             self.persistent_memory = None
         
+        # Shared buffer for cross-layer LTM communication
+        # MAG layers write their ltm_out here, and read previous layer's ltm_out
+        # This avoids changing the return format of decoder layers
+        self._ltm_buffer = {}
+        self._gate_values_buffer = {}
+        
         self._patch_layers()
         self._freeze_base_components()
         
@@ -232,6 +251,7 @@ class Qwen3MAGModel(nn.Module):
                     layer_idx=idx,
                     config=self.mag_config,
                     n_layers_total=self.n_layers,
+                    parent_model=self,  # Pass reference for LTM buffer access
                 )
                 # Match dtype and device of base model
                 mag_layer = mag_layer.to(dtype=dtype, device=device)
@@ -312,6 +332,11 @@ class Qwen3MAGModel(nn.Module):
         return outputs
     
     def reset_all_memory(self):
+        # Clear the LTM communication buffers
+        self._ltm_buffer.clear()
+        self._gate_values_buffer.clear()
+        
+        # Reset memory in each MAG layer
         for layer in self.mag_layers:
             if layer is not None:
                 layer.reset_memory()
