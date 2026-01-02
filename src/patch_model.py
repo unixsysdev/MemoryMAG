@@ -182,7 +182,7 @@ class Qwen3MAGDecoderLayer(nn.Module):
 class Qwen3MAGModel(nn.Module):
     """Complete Qwen3 model with MAG augmentation."""
     
-    def __init__(self, base_model: nn.Module, config: Qwen3MAGConfig):
+    def __init__(self, base_model: nn.Module, config: Qwen3MAGConfig, gradient_checkpointing: bool = False):
         super().__init__()
         
         self.base_model = base_model
@@ -206,6 +206,10 @@ class Qwen3MAGModel(nn.Module):
         
         self._patch_layers()
         self._freeze_base_components()
+        
+        # Enable gradient checkpointing for memory efficiency
+        if gradient_checkpointing:
+            self.base_model.gradient_checkpointing_enable()
     
     def _patch_layers(self):
         if hasattr(self.base_model, 'model'):
@@ -333,8 +337,17 @@ def patch_qwen3_with_mag(
     config: Optional[Qwen3MAGConfig] = None,
     device: str = "auto",
     dtype: torch.dtype = torch.bfloat16,
+    gradient_checkpointing: bool = False,
 ) -> Qwen3MAGModel:
-    """Load Qwen3 and patch with MAG components."""
+    """Load Qwen3 and patch with MAG components.
+    
+    Args:
+        model_name_or_path: HuggingFace model identifier or local path
+        config: MAG configuration
+        device: Device to load model on ("auto", "cuda", "cpu")
+        dtype: Model dtype (torch.bfloat16, torch.float16, etc.)
+        gradient_checkpointing: Enable gradient checkpointing to reduce memory usage
+    """
     if config is None:
         config = Qwen3MAGConfig()
     
@@ -348,11 +361,13 @@ def patch_qwen3_with_mag(
     
     logger.info(f"Base model params: {sum(p.numel() for p in base_model.parameters()):,}")
     
-    mag_model = Qwen3MAGModel(base_model, config)
+    mag_model = Qwen3MAGModel(base_model, config, gradient_checkpointing=gradient_checkpointing)
     
     trainable = mag_model.count_trainable_parameters()
     total = sum(p.numel() for p in mag_model.parameters())
     
     logger.info(f"MAG model created. Trainable: {trainable:,} / Total: {total:,}")
+    if gradient_checkpointing:
+        logger.info("Gradient checkpointing enabled for memory efficiency")
     
     return mag_model

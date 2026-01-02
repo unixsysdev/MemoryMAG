@@ -444,10 +444,14 @@ def main():
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     
+    # Memory optimization
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                       help="Enable gradient checkpointing to reduce memory usage (slower but uses less VRAM)")
+    
     args = parser.parse_args()
     
     # Create config
-    config = TrainingConfig(**vars(args))
+    config = TrainingConfig(**{k: v for k, v in vars(args).items() if hasattr(TrainingConfig, k)})
     
     # Setup dtype
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
@@ -472,6 +476,7 @@ def main():
         config=mag_config,
         device=args.device,
         dtype=dtype,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
     
     # Load datasets
