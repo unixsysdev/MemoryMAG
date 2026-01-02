@@ -12,6 +12,7 @@ with MAG components. The patching strategy:
 6. Modify forward pass for ltm_out propagation
 """
 
+import weakref
 import torch
 import torch.nn as nn
 from typing import Optional, List, Any
@@ -67,7 +68,8 @@ class Qwen3MAGDecoderLayer(nn.Module):
         
         self.layer_idx = layer_idx
         self.d_model = d_model
-        self.parent_model = parent_model  # Reference to Qwen3MAGModel for LTM buffer
+        # Use weakref to avoid circular reference (which causes recursion in .to())
+        self._parent_model_ref = weakref.ref(parent_model) if parent_model is not None else None
         
         # Copy attributes from original layer that Qwen3 expects
         if hasattr(original_layer, 'attention_type'):
@@ -109,6 +111,13 @@ class Qwen3MAGDecoderLayer(nn.Module):
         
         self.gate = MAGGate(d_model=d_model, init_bias=config.gate_init_bias)
         self.memory_norm = nn.LayerNorm(d_model)
+    
+    @property
+    def parent_model(self):
+        """Get parent model from weakref."""
+        if self._parent_model_ref is None:
+            return None
+        return self._parent_model_ref()
         
     def forward(
         self,
