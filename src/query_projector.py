@@ -90,6 +90,15 @@ class QueryProjector(nn.Module):
         """
         batch, seq_len, _ = hidden_states.shape
         dtype = hidden_states.dtype
+
+        target_dtype = None
+        if hasattr(self, "proj"):
+            target_dtype = self.proj.weight.dtype
+        elif hasattr(self, "proj_h"):
+            target_dtype = self.proj_h.weight.dtype
+
+        if target_dtype is not None and hidden_states.dtype != target_dtype:
+            hidden_states = hidden_states.to(dtype=target_dtype)
         
         if self.use_prev_memory and prev_ltm_out is not None:
             # Ensure prev_ltm_out matches dtype
