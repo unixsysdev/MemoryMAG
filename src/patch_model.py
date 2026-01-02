@@ -357,12 +357,14 @@ class Qwen3MAGModel(nn.Module):
                     dim=1,
                 )
         
-        base_embed = self.base_model.model.embed_tokens if hasattr(self.base_model, 'model') else self.base_model.embed_tokens
-        embed_dtype = base_embed.weight.dtype
-        if inputs_embeds.dtype != embed_dtype:
-            inputs_embeds = inputs_embeds.to(dtype=embed_dtype)
+        target_dtype = inputs_embeds.dtype
+        lm_weight = getattr(self.base_model.lm_head, "weight", None)
+        if lm_weight is not None and lm_weight.is_floating_point():
+            target_dtype = lm_weight.dtype
+        if inputs_embeds.dtype != target_dtype:
+            inputs_embeds = inputs_embeds.to(dtype=target_dtype)
 
-        outputs = self.base_model(
+        base_outputs = self.base_model.model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -370,31 +372,43 @@ class Qwen3MAGModel(nn.Module):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            return_dict=True,
             **kwargs,
         )
 
-        # Ensure logits are computed with the lm_head dtype when quantized
-        if hasattr(self.base_model, "lm_head") and hasattr(outputs, "logits"):
-            lm_dtype = self.base_model.lm_head.weight.dtype
-            if outputs.logits is not None and outputs.logits.dtype != lm_dtype:
-                outputs.logits = outputs.logits.to(dtype=lm_dtype)
+        hidden_states = base_outputs[0]
+        lm_weight = getattr(self.base_model.lm_head, "weight", None)
+        lm_dtype = lm_weight.dtype if lm_weight is not None and lm_weight.is_floating_point() else hidden_states.dtype
+        hidden_states_for_lm = hidden_states if hidden_states.dtype == lm_dtype else hidden_states.to(dtype=lm_dtype)
+        logits = self.base_model.lm_head(hidden_states_for_lm)
         
-        if self.persistent_memory is not None and hasattr(outputs, 'logits'):
-            outputs.logits = outputs.logits[:, self.mag_config.n_persistent_tokens:, :]
+        if self.persistent_memory is not None and logits is not None:
+            logits = logits[:, self.mag_config.n_persistent_tokens:, :]
         
-        if labels is not None:
-            logits = outputs.logits if hasattr(outputs, 'logits') else outputs[0]
+        loss = None
+        if labels is not None and logits is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = nn.CrossEntropyLoss()(
                 shift_logits.view(-1, self.vocab_size),
                 shift_labels.view(-1)
             )
-            if hasattr(outputs, 'loss'):
-                outputs.loss = loss
-        
-        return outputs
+
+        if return_dict is None:
+            return_dict = getattr(self.base_model.config, "use_return_dict", True)
+
+        if return_dict:
+            from transformers.modeling_outputs import CausalLMOutputWithPast
+            return CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=base_outputs.past_key_values,
+                hidden_states=base_outputs.hidden_states,
+                attentions=base_outputs.attentions,
+            )
+
+        outputs = (logits, base_outputs.past_key_values, base_outputs.hidden_states, base_outputs.attentions)
+        return (loss,) + outputs if loss is not None else outputs
 
     def _strip_persistent_from_generate(self, outputs):
         if self.mag_config.n_persistent_tokens <= 0:
@@ -468,6 +482,13 @@ class Qwen3MAGModel(nn.Module):
                     [persistent_positions, position_ids + self.mag_config.n_persistent_tokens],
                     dim=1,
                 )
+
+        lm_weight = getattr(self.base_model.lm_head, "weight", None)
+        target_dtype = inputs_embeds.dtype
+        if lm_weight is not None and lm_weight.is_floating_point():
+            target_dtype = lm_weight.dtype
+        if inputs_embeds.dtype != target_dtype:
+            inputs_embeds = inputs_embeds.to(dtype=target_dtype)
 
         if position_ids is not None:
             kwargs["position_ids"] = position_ids
@@ -553,7 +574,7 @@ def patch_qwen3_with_mag(
 
     base_model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
-        torch_dtype=None if quantization_config is not None else dtype,
+        torch_dtype=dtype,
         device_map=device,
         attn_implementation=attn_implementation,
         quantization_config=quantization_config,

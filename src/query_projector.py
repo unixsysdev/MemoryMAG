@@ -99,6 +99,7 @@ class QueryProjector(nn.Module):
 
         if target_dtype is not None and hidden_states.dtype != target_dtype:
             hidden_states = hidden_states.to(dtype=target_dtype)
+            dtype = hidden_states.dtype
         
         if self.use_prev_memory and prev_ltm_out is not None:
             # Ensure prev_ltm_out matches dtype
