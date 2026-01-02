@@ -108,15 +108,34 @@ python data/generate_code_retrieval.py \
 ### 3. Train MAG Components
 
 ```bash
+# Phase 1: Hash-Hop (exact retrieval)
 python training/train_mag.py \
     --model_name Qwen/Qwen3-1.7B \
-    --data_path data/hash_hop_64k.jsonl \
-    --output_dir checkpoints/ \
+    --data_path data/hash_hop_16k.jsonl \
+    --output_dir checkpoints/phase1 \
     --learning_rate 1e-4 \
-    --num_epochs 3 \
-    --batch_size 1 \
-    --gradient_accumulation_steps 8
+    --num_epochs 3
+
+# Phase 2: Dependency (builds on Phase 1 checkpoint)
+python training/train_mag.py \
+    --model_name Qwen/Qwen3-1.7B \
+    --data_path data/dependency_2hop.jsonl \
+    --output_dir checkpoints/phase2 \
+    --resume_from checkpoints/phase1/best \
+    --learning_rate 5e-5 \
+    --num_epochs 3
+
+# Phase 3: Code (builds on Phase 2 checkpoint)
+python training/train_mag.py \
+    --model_name Qwen/Qwen3-1.7B \
+    --data_path data/code_retrieval.jsonl \
+    --output_dir checkpoints/phase3 \
+    --resume_from checkpoints/phase2/best \
+    --learning_rate 3e-5 \
+    --num_epochs 3
 ```
+
+Checkpoints chain automatically - each phase builds on the previous phase's learned weights.
 
 ### 4. Evaluate
 
