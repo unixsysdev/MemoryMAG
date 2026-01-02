@@ -345,6 +345,11 @@ class Qwen3MAGModel(nn.Module):
                     dim=1,
                 )
         
+        base_embed = self.base_model.model.embed_tokens if hasattr(self.base_model, 'model') else self.base_model.embed_tokens
+        embed_dtype = base_embed.weight.dtype
+        if inputs_embeds.dtype != embed_dtype:
+            inputs_embeds = inputs_embeds.to(dtype=embed_dtype)
+
         outputs = self.base_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
