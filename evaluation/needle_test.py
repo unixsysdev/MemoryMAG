@@ -354,6 +354,14 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--load_in_8bit", action="store_true", help="Load base model in 8-bit (bitsandbytes)")
     parser.add_argument("--load_in_4bit", action="store_true", help="Load base model in 4-bit (bitsandbytes)")
+    parser.add_argument("--memory_layers", type=int, default=2)
+    parser.add_argument("--d_memory", type=int, default=None)
+    parser.add_argument("--chunk_size", type=int, default=64)
+    parser.add_argument("--n_persistent_tokens", type=int, default=16)
+    parser.add_argument("--patch_layers", type=str, default="all",
+                        help="Which layers to patch: 'all', 'every_N', 'last_N', or comma-separated indices")
+    parser.add_argument("--attn_implementation", type=str, default="eager",
+                        choices=["eager", "sdpa", "flash_attention_2"])
     
     args = parser.parse_args()
     
@@ -364,7 +372,7 @@ def main():
     context_lengths = [int(x) for x in args.context_lengths.split(",")]
     
     # Load model
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, AutoConfig
     from src.patch_model import patch_qwen3_with_mag, Qwen3MAGConfig
     
     logger.info(f"Loading model...")
@@ -376,11 +384,32 @@ def main():
     if args.load_in_8bit and args.load_in_4bit:
         raise ValueError("Choose only one of --load_in_8bit or --load_in_4bit")
 
-    config = Qwen3MAGConfig()
+    # Parse layers_to_patch
+    layers_to_patch = None
+    if args.patch_layers != "all":
+        if args.patch_layers.startswith("every_"):
+            n = int(args.patch_layers.split("_")[1])
+            model_config = AutoConfig.from_pretrained(args.model_name)
+            layers_to_patch = list(range(0, model_config.num_hidden_layers, n))
+        elif args.patch_layers.startswith("last_"):
+            n = int(args.patch_layers.split("_")[1])
+            model_config = AutoConfig.from_pretrained(args.model_name)
+            layers_to_patch = list(range(model_config.num_hidden_layers - n, model_config.num_hidden_layers))
+        else:
+            layers_to_patch = [int(x.strip()) for x in args.patch_layers.split(",")]
+
+    config = Qwen3MAGConfig(
+        memory_layers=args.memory_layers,
+        d_memory=args.d_memory,
+        chunk_size=args.chunk_size,
+        n_persistent_tokens=args.n_persistent_tokens,
+        layers_to_patch=layers_to_patch,
+    )
     model = patch_qwen3_with_mag(
         model_name_or_path=args.model_name,
         config=config,
         device=args.device,
+        attn_implementation=args.attn_implementation,
         load_in_8bit=args.load_in_8bit,
         load_in_4bit=args.load_in_4bit,
     )
