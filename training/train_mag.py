@@ -220,6 +220,8 @@ class Trainer:
             self.device = torch.device(config.device)
         
         self.model = self.model.to(self.device)
+        if hasattr(self.model, "base_model") and hasattr(self.model.base_model, "config"):
+            self.model.base_model.config.use_cache = False
         
         self.stage1_end = config.stage1_steps
         self.stage2_end = config.stage1_steps + config.stage2_steps
@@ -418,6 +420,7 @@ class Trainer:
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 labels=batch["labels"],
+                use_cache=False,
             )
             
             loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
@@ -486,6 +489,7 @@ class Trainer:
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 labels=batch["labels"],
+                use_cache=False,
             )
             
             loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
