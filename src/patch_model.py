@@ -373,6 +373,12 @@ class Qwen3MAGModel(nn.Module):
             return_dict=return_dict,
             **kwargs,
         )
+
+        # Ensure logits are computed with the lm_head dtype when quantized
+        if hasattr(self.base_model, "lm_head") and hasattr(outputs, "logits"):
+            lm_dtype = self.base_model.lm_head.weight.dtype
+            if outputs.logits is not None and outputs.logits.dtype != lm_dtype:
+                outputs.logits = outputs.logits.to(dtype=lm_dtype)
         
         if self.persistent_memory is not None and hasattr(outputs, 'logits'):
             outputs.logits = outputs.logits[:, self.mag_config.n_persistent_tokens:, :]
