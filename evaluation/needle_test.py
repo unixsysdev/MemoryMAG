@@ -384,7 +384,7 @@ def main():
     checkpoint_path = Path(args.checkpoint) / "checkpoint.pt"
     if checkpoint_path.exists():
         logger.info(f"Loading checkpoint from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=args.device)
+        checkpoint = torch.load(checkpoint_path, map_location=args.device, weights_only=False)
         model_state = model.state_dict()
         for name, param in checkpoint['trainable_state'].items():
             if name in model_state:
