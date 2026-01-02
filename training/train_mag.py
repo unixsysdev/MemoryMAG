@@ -292,6 +292,9 @@ class Trainer:
     def _set_requires_grad_by_stage(self, stage: str):
         """Enable parameters for the given training stage."""
         for name, param in self.model.named_parameters():
+            if not (param.is_floating_point() or param.is_complex()):
+                param.requires_grad = False
+                continue
             name_lower = name.lower()
             if stage == "gates":
                 param.requires_grad = "gate" in name_lower
