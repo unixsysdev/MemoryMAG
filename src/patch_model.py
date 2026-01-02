@@ -214,11 +214,18 @@ class Qwen3MAGDecoderLayer(nn.Module):
 class Qwen3MAGModel(nn.Module):
     """Complete Qwen3 model with MAG augmentation."""
     
-    def __init__(self, base_model: nn.Module, config: Qwen3MAGConfig, gradient_checkpointing: bool = False):
+    def __init__(
+        self,
+        base_model: nn.Module,
+        config: Qwen3MAGConfig,
+        gradient_checkpointing: bool = False,
+        mag_dtype: Optional[torch.dtype] = None,
+    ):
         super().__init__()
         
         self.base_model = base_model
         self.mag_config = config
+        self.mag_dtype = mag_dtype
         self.model_config = base_model.config
         self.d_model = self.model_config.hidden_size
         self.n_layers = self.model_config.num_hidden_layers
@@ -255,8 +262,8 @@ class Qwen3MAGModel(nn.Module):
         else:
             decoder_layers = self.base_model.layers
         
-        # Get dtype from base model
-        dtype = next(self.base_model.parameters()).dtype
+        # Get dtype/device for MAG layers
+        dtype = self.mag_dtype if self.mag_dtype is not None else next(self.base_model.parameters()).dtype
         device = next(self.base_model.parameters()).device
         
         self.mag_layers = nn.ModuleList()
@@ -484,6 +491,8 @@ def patch_qwen3_with_mag(
     dtype: torch.dtype = torch.bfloat16,
     gradient_checkpointing: bool = False,
     attn_implementation: str = "eager",
+    load_in_8bit: bool = False,
+    load_in_4bit: bool = False,
 ) -> Qwen3MAGModel:
     """Load Qwen3 and patch with MAG components.
     
@@ -504,16 +513,34 @@ def patch_qwen3_with_mag(
     logger.info(f"Loading base model: {model_name_or_path}")
     logger.info(f"Using attention implementation: {attn_implementation}")
     
+    quantization_config = None
+    if load_in_8bit or load_in_4bit:
+        try:
+            from transformers import BitsAndBytesConfig
+        except Exception as exc:
+            raise RuntimeError("bitsandbytes/transformers quantization not available") from exc
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=load_in_8bit,
+            load_in_4bit=load_in_4bit,
+            bnb_4bit_compute_dtype=dtype if load_in_4bit else None,
+        )
+
     base_model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
-        torch_dtype=dtype,
+        torch_dtype=None if quantization_config is not None else dtype,
         device_map=device,
         attn_implementation=attn_implementation,
+        quantization_config=quantization_config,
     )
     
     logger.info(f"Base model params: {sum(p.numel() for p in base_model.parameters()):,}")
     
-    mag_model = Qwen3MAGModel(base_model, config, gradient_checkpointing=gradient_checkpointing)
+    mag_model = Qwen3MAGModel(
+        base_model,
+        config,
+        gradient_checkpointing=gradient_checkpointing,
+        mag_dtype=dtype,
+    )
     
     trainable = mag_model.count_trainable_parameters()
     total = sum(p.numel() for p in mag_model.parameters())

@@ -603,6 +603,10 @@ def main():
                        help="Which layers to patch: 'all', 'every_N' (e.g. 'every_4'), 'last_N' (e.g. 'last_8'), or comma-separated indices")
     parser.add_argument("--optim_8bit", action="store_true",
                        help="Use 8-bit AdamW optimizer (requires bitsandbytes, saves ~50%% optimizer memory)")
+    parser.add_argument("--load_in_8bit", action="store_true",
+                       help="Load base model in 8-bit (bitsandbytes)")
+    parser.add_argument("--load_in_4bit", action="store_true",
+                       help="Load base model in 4-bit (bitsandbytes)")
     
     args = parser.parse_args()
     
@@ -650,6 +654,8 @@ def main():
     
     # Load and patch model
     logger.info(f"Loading model: {args.model_name}")
+    if args.load_in_8bit and args.load_in_4bit:
+        raise ValueError("Choose only one of --load_in_8bit or --load_in_4bit")
     
     # If using dynamic layer selection, we need to know n_layers first
     if isinstance(layers_to_patch, tuple):
@@ -670,6 +676,8 @@ def main():
         dtype=dtype,
         gradient_checkpointing=args.gradient_checkpointing,
         attn_implementation=args.attn_implementation,
+        load_in_8bit=args.load_in_8bit,
+        load_in_4bit=args.load_in_4bit,
     )
     
     # Load datasets
