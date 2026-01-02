@@ -73,7 +73,10 @@ class MAGGate(nn.Module):
         ltm_out = ltm_out.to(dtype=dtype)
         
         # Compute gate values
-        g = torch.sigmoid(self.gate_proj(hidden_states) * self.gate_scale)
+        proj_dtype = self.gate_proj.weight.dtype
+        if hidden_states.dtype != proj_dtype:
+            hidden_states = hidden_states.to(dtype=proj_dtype)
+        g = torch.sigmoid(self.gate_proj(hidden_states) * self.gate_scale.to(dtype=proj_dtype))
         
         # Gated mixture
         output = (1 - g) * attn_out + g * ltm_out
