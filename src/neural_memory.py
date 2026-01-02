@@ -340,10 +340,11 @@ class NeuralMemory(nn.Module):
                 # Update weights with momentum and weight decay
                 # S_t = η * S_{t-1} - θ * ∇L (momentum update)
                 # M_t = (1 - α) * M_{t-1} + S_t (weight decay + gradient)
-                eta = self.eta
-                theta = self.theta
-                alpha = self.alpha
-                
+                if do_update:
+                    eta = self.eta
+                    theta = self.theta
+                    alpha = self.alpha
+                    
                     for i, (w, g, s) in enumerate(zip(current_weights, grads, self._momentum_state)):
                         g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
                         if self.max_update_norm is not None:
