@@ -347,6 +347,8 @@ def main():
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--load_in_8bit", action="store_true", help="Load base model in 8-bit (bitsandbytes)")
+    parser.add_argument("--load_in_4bit", action="store_true", help="Load base model in 4-bit (bitsandbytes)")
     
     args = parser.parse_args()
     
@@ -366,11 +368,16 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
+    if args.load_in_8bit and args.load_in_4bit:
+        raise ValueError("Choose only one of --load_in_8bit or --load_in_4bit")
+
     config = Qwen3MAGConfig()
     model = patch_qwen3_with_mag(
         model_name_or_path=args.model_name,
         config=config,
         device=args.device,
+        load_in_8bit=args.load_in_8bit,
+        load_in_4bit=args.load_in_4bit,
     )
     
     # Load checkpoint
