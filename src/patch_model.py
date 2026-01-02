@@ -183,6 +183,9 @@ class Qwen3MAGDecoderLayer(nn.Module):
         # Memory path (trainable) - ensure dtype consistency
         query = self.query_projector(hidden_states, prev_ltm_out)
         ltm_out, _ = self.neural_memory(query, update_memory=True, return_surprise=True)
+        norm_dtype = self.memory_norm.weight.dtype
+        if ltm_out.dtype != norm_dtype:
+            ltm_out = ltm_out.to(dtype=norm_dtype)
         ltm_out = self.memory_norm(ltm_out)
         ltm_out = torch.nan_to_num(ltm_out, nan=0.0, posinf=0.0, neginf=0.0)
         ltm_out = ltm_out.to(dtype=dtype)
