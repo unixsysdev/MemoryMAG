@@ -384,7 +384,19 @@ def main():
     checkpoint_path = Path(args.checkpoint) / "checkpoint.pt"
     if checkpoint_path.exists():
         logger.info(f"Loading checkpoint from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=args.device, weights_only=True)
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=args.device, weights_only=True)
+        except Exception:
+            try:
+                from training.train_mag import TrainingConfig
+                try:
+                    from torch.serialization import safe_globals
+                    with safe_globals([TrainingConfig]):
+                        checkpoint = torch.load(checkpoint_path, map_location=args.device, weights_only=True)
+                except Exception:
+                    checkpoint = torch.load(checkpoint_path, map_location=args.device, weights_only=False)
+            except Exception as exc:
+                raise RuntimeError("Failed to load checkpoint; TrainingConfig not available") from exc
         model_state = model.state_dict()
         for name, param in checkpoint['trainable_state'].items():
             if name in model_state:
