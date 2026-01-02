@@ -189,6 +189,7 @@ class Qwen3MAGDecoderLayer(nn.Module):
             attn_out = attn_outputs[0]
         else:
             attn_out = attn_outputs
+        attn_out = torch.nan_to_num(attn_out, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Memory path (trainable) - ensure dtype consistency
         query = self.query_projector(hidden_states, prev_ltm_out)
@@ -377,6 +378,7 @@ class Qwen3MAGModel(nn.Module):
         )
 
         hidden_states = base_outputs[0]
+        hidden_states = torch.nan_to_num(hidden_states, nan=0.0, posinf=0.0, neginf=0.0)
         lm_weight = getattr(self.base_model.lm_head, "weight", None)
         lm_dtype = lm_weight.dtype if lm_weight is not None and lm_weight.is_floating_point() else hidden_states.dtype
         hidden_states_for_lm = hidden_states if hidden_states.dtype == lm_dtype else hidden_states.to(dtype=lm_dtype)
