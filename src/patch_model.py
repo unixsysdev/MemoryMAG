@@ -67,6 +67,12 @@ class Qwen3MAGDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.d_model = d_model
         
+        # Copy attributes from original layer that Qwen3 expects
+        if hasattr(original_layer, 'attention_type'):
+            self.attention_type = original_layer.attention_type
+        if hasattr(original_layer, 'is_sliding'):
+            self.is_sliding = original_layer.is_sliding
+        
         # Store original components
         self.self_attn = original_layer.self_attn
         self.mlp = original_layer.mlp
