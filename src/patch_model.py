@@ -157,12 +157,8 @@ class Qwen3MAGDecoderLayer(nn.Module):
         
         if isinstance(attn_outputs, tuple):
             attn_out = attn_outputs[0]
-            present_key_value = attn_outputs[1] if len(attn_outputs) > 1 else None
-            attn_weights = attn_outputs[2] if output_attentions and len(attn_outputs) > 2 else None
         else:
             attn_out = attn_outputs
-            present_key_value = None
-            attn_weights = None
         
         # Memory path (trainable) - ensure dtype consistency
         query = self.query_projector(hidden_states, prev_ltm_out)
@@ -187,15 +183,10 @@ class Qwen3MAGDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         
-        # Return in standard HuggingFace format (same as original Qwen3DecoderLayer)
-        # This ensures compatibility with non-patched layers and gradient checkpointing
-        outputs = (hidden_states,)
-        if use_cache:
-            outputs = outputs + (present_key_value,)
-        if output_attentions:
-            outputs = outputs + (attn_weights,)
-        
-        return outputs
+        # Return just hidden_states tensor (same as original Qwen3DecoderLayer)
+        # The Qwen3 model loop does: hidden_states = decoder_layer(hidden_states, ...)
+        # It expects a tensor, not a tuple
+        return hidden_states
     
     def reset_memory(self):
         self.neural_memory.reset_memory()
