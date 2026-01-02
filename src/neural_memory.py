@@ -343,30 +343,30 @@ class NeuralMemory(nn.Module):
                     do_update = False
 
                 if do_update:
-                    # Compute weight gradients
-                    grads = self.compute_weight_gradients(keys, values, current_weights)
-                
-                # Update weights with momentum and weight decay
-                # S_t = η * S_{t-1} - θ * ∇L (momentum update)
-                # M_t = (1 - α) * M_{t-1} + S_t (weight decay + gradient)
-                if do_update:
-                    eta = self.eta
-                    theta = self.theta
-                    alpha = self.alpha
+                    with torch.no_grad():
+                        # Compute weight gradients
+                        grads = self.compute_weight_gradients(keys, values, current_weights)
                     
-                    for i, (w, g, s) in enumerate(zip(current_weights, grads, self._momentum_state)):
-                        g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
-                        if self.max_update_norm is not None:
-                            grad_norm = torch.linalg.vector_norm(g)
-                            if torch.isfinite(grad_norm) and grad_norm > self.max_update_norm:
-                                g = g * (self.max_update_norm / (grad_norm + 1e-6))
-                        # Update momentum
-                        s_new = eta * s - theta * g
-                        s_new = torch.nan_to_num(s_new, nan=0.0, posinf=0.0, neginf=0.0)
-                        self._momentum_state[i] = s_new
+                        # Update weights with momentum and weight decay
+                        # S_t = η * S_{t-1} - θ * ∇L (momentum update)
+                        # M_t = (1 - α) * M_{t-1} + S_t (weight decay + gradient)
+                        eta = self.eta
+                        theta = self.theta
+                        alpha = self.alpha
                         
-                        # Update weights with decay
-                        current_weights[i] = (1 - alpha) * w + s_new
+                        for i, (w, g, s) in enumerate(zip(current_weights, grads, self._momentum_state)):
+                            g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+                            if self.max_update_norm is not None:
+                                grad_norm = torch.linalg.vector_norm(g)
+                                if torch.isfinite(grad_norm) and grad_norm > self.max_update_norm:
+                                    g = g * (self.max_update_norm / (grad_norm + 1e-6))
+                            # Update momentum
+                            s_new = eta * s - theta * g
+                            s_new = torch.nan_to_num(s_new, nan=0.0, posinf=0.0, neginf=0.0)
+                            self._momentum_state[i] = s_new
+                            
+                            # Update weights with decay
+                            current_weights[i] = (1 - alpha) * w + s_new
             
             # Retrieve using updated weights
             q = self.conv_q(self.query_proj(proj_chunk).transpose(1, 2))[:, :, :proj_chunk.shape[1]].transpose(1, 2)
