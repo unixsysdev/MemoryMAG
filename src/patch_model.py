@@ -120,6 +120,13 @@ class Qwen3MAGDecoderLayer(nn.Module):
         prev_ltm_out: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        # Handle case where hidden_states is a tuple from a previous MAG layer
+        # Tuple format: (hidden_states, ltm_out, gate_values, [present_key_value], [attn_weights])
+        if isinstance(hidden_states, tuple):
+            if len(hidden_states) >= 2:
+                prev_ltm_out = hidden_states[1]  # Extract ltm_out from previous layer
+            hidden_states = hidden_states[0]  # Extract actual hidden states
+        
         dtype = hidden_states.dtype
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
