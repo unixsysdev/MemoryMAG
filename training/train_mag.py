@@ -431,6 +431,10 @@ def main():
     parser.add_argument("--eval_steps", type=int, default=100)
     parser.add_argument("--logging_steps", type=int, default=10)
     
+    # Resume from previous checkpoint (for curriculum training)
+    parser.add_argument("--resume_from", type=str, default=None,
+                       help="Path to checkpoint dir to resume from (e.g., checkpoints/phase1/best)")
+    
     # Hardware
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--dtype", type=str, default="bfloat16")
@@ -490,6 +494,15 @@ def main():
         config=config,
         tokenizer=tokenizer,
     )
+    
+    # Resume from checkpoint if specified (for curriculum continuation)
+    if args.resume_from:
+        checkpoint_file = Path(args.resume_from) / "checkpoint.pt"
+        if checkpoint_file.exists():
+            logger.info(f"Resuming from {args.resume_from}")
+            trainer.load_checkpoint(str(checkpoint_file))
+        else:
+            logger.warning(f"Checkpoint not found at {checkpoint_file}, starting fresh")
     
     trainer.train()
 
