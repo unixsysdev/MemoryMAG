@@ -85,9 +85,14 @@ class NeuralMemory(nn.Module):
         if learnable_params:
             # These will be learned during outer-loop training
             # Using sigmoid to constrain to [0, 1]
-            self.log_momentum = nn.Parameter(torch.tensor(math.log(momentum / (1 - momentum + 1e-8))))
-            self.log_lr = nn.Parameter(torch.tensor(math.log(lr)))
-            self.log_weight_decay = nn.Parameter(torch.tensor(math.log(weight_decay / (1 - weight_decay + 1e-8))))
+            def _safe_logit(value: float, eps: float = 1e-6) -> float:
+                clamped = min(max(value, eps), 1.0 - eps)
+                return math.log(clamped / (1.0 - clamped))
+
+            safe_lr = max(lr, 1e-8)
+            self.log_momentum = nn.Parameter(torch.tensor(_safe_logit(momentum)))
+            self.log_lr = nn.Parameter(torch.tensor(math.log(safe_lr)))
+            self.log_weight_decay = nn.Parameter(torch.tensor(_safe_logit(weight_decay)))
         else:
             self.register_buffer('momentum', torch.tensor(momentum))
             self.register_buffer('lr', torch.tensor(lr))
