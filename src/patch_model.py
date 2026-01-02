@@ -205,6 +205,10 @@ class Qwen3MAGModel(nn.Module):
         else:
             decoder_layers = self.base_model.layers
         
+        # Get dtype from base model
+        dtype = next(self.base_model.parameters()).dtype
+        device = next(self.base_model.parameters()).device
+        
         self.mag_layers = nn.ModuleList()
         
         for idx in range(self.n_layers):
@@ -217,6 +221,8 @@ class Qwen3MAGModel(nn.Module):
                     config=self.mag_config,
                     n_layers_total=self.n_layers,
                 )
+                # Match dtype and device of base model
+                mag_layer = mag_layer.to(dtype=dtype, device=device)
                 self.mag_layers.append(mag_layer)
                 decoder_layers[idx] = mag_layer
             else:
