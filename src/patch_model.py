@@ -338,6 +338,7 @@ def patch_qwen3_with_mag(
     device: str = "auto",
     dtype: torch.dtype = torch.bfloat16,
     gradient_checkpointing: bool = False,
+    attn_implementation: str = "eager",
 ) -> Qwen3MAGModel:
     """Load Qwen3 and patch with MAG components.
     
@@ -347,16 +348,22 @@ def patch_qwen3_with_mag(
         device: Device to load model on ("auto", "cuda", "cpu")
         dtype: Model dtype (torch.bfloat16, torch.float16, etc.)
         gradient_checkpointing: Enable gradient checkpointing to reduce memory usage
+        attn_implementation: Attention implementation ("eager", "sdpa", "flash_attention_2")
+            - "eager": Standard attention (high memory, O(n²))
+            - "sdpa": PyTorch scaled_dot_product_attention (memory efficient when available)  
+            - "flash_attention_2": Flash Attention 2 (requires flash-attn package)
     """
     if config is None:
         config = Qwen3MAGConfig()
     
     logger.info(f"Loading base model: {model_name_or_path}")
+    logger.info(f"Using attention implementation: {attn_implementation}")
     
     base_model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
         torch_dtype=dtype,
         device_map=device,
+        attn_implementation=attn_implementation,
     )
     
     logger.info(f"Base model params: {sum(p.numel() for p in base_model.parameters()):,}")

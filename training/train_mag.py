@@ -190,6 +190,7 @@ class Trainer:
         eval_dataset: Optional[Dataset],
         config: TrainingConfig,
         tokenizer,
+        use_8bit_optimizer: bool = False,
     ):
         self.model = model
         self.train_dataset = train_dataset
@@ -213,7 +214,17 @@ class Trainer:
         for group in param_groups:
             group['params'] = [p for p in group['params'] if p.requires_grad]
         
-        self.optimizer = AdamW(param_groups)
+        # Use 8-bit optimizer to save memory (requires bitsandbytes)
+        if use_8bit_optimizer:
+            try:
+                import bitsandbytes as bnb
+                self.optimizer = bnb.optim.AdamW8bit(param_groups)
+                logger.info("Using 8-bit AdamW optimizer (saves ~50% optimizer memory)")
+            except ImportError:
+                logger.warning("bitsandbytes not installed, falling back to standard AdamW. Install with: pip install bitsandbytes")
+                self.optimizer = AdamW(param_groups)
+        else:
+            self.optimizer = AdamW(param_groups)
         
         # Setup scheduler
         total_steps = (len(train_dataset) // config.batch_size // config.gradient_accumulation_steps) * config.num_epochs
@@ -447,6 +458,13 @@ def main():
     # Memory optimization
     parser.add_argument("--gradient_checkpointing", action="store_true",
                        help="Enable gradient checkpointing to reduce memory usage (slower but uses less VRAM)")
+    parser.add_argument("--attn_implementation", type=str, default="sdpa",
+                       choices=["eager", "sdpa", "flash_attention_2"],
+                       help="Attention implementation: eager (high memory), sdpa (memory efficient), flash_attention_2 (fastest, needs flash-attn)")
+    parser.add_argument("--patch_layers", type=str, default="all",
+                       help="Which layers to patch: 'all', 'every_N' (e.g. 'every_4'), 'last_N' (e.g. 'last_8'), or comma-separated indices")
+    parser.add_argument("--optim_8bit", action="store_true",
+                       help="Use 8-bit AdamW optimizer (requires bitsandbytes, saves ~50%% optimizer memory)")
     
     args = parser.parse_args()
     
@@ -462,21 +480,52 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Create MAG config
+    # Parse layers_to_patch
+    layers_to_patch = None
+    if args.patch_layers != "all":
+        if args.patch_layers.startswith("every_"):
+            # Every Nth layer
+            n = int(args.patch_layers.split("_")[1])
+            # Will be computed after model load to know total layers
+            layers_to_patch = ("every", n)
+        elif args.patch_layers.startswith("last_"):
+            # Last N layers
+            n = int(args.patch_layers.split("_")[1])
+            layers_to_patch = ("last", n)
+        else:
+            # Comma-separated indices
+            layers_to_patch = [int(x.strip()) for x in args.patch_layers.split(",")]
+    
+    # Create MAG config (layers_to_patch will be updated after we know n_layers)
     mag_config = Qwen3MAGConfig(
         memory_layers=args.memory_layers,
         n_persistent_tokens=args.n_persistent_tokens,
         chunk_size=args.chunk_size,
+        layers_to_patch=layers_to_patch if isinstance(layers_to_patch, list) else None,
     )
     
     # Load and patch model
     logger.info(f"Loading model: {args.model_name}")
+    
+    # If using dynamic layer selection, we need to know n_layers first
+    if isinstance(layers_to_patch, tuple):
+        from transformers import AutoConfig
+        model_config = AutoConfig.from_pretrained(args.model_name)
+        n_layers = model_config.num_hidden_layers
+        mode, n = layers_to_patch
+        if mode == "every":
+            mag_config.layers_to_patch = list(range(0, n_layers, n))
+        elif mode == "last":
+            mag_config.layers_to_patch = list(range(n_layers - n, n_layers))
+        logger.info(f"Patching layers: {mag_config.layers_to_patch}")
+    
     model = patch_qwen3_with_mag(
         model_name_or_path=args.model_name,
         config=mag_config,
         device=args.device,
         dtype=dtype,
         gradient_checkpointing=args.gradient_checkpointing,
+        attn_implementation=args.attn_implementation,
     )
     
     # Load datasets
@@ -503,6 +552,7 @@ def main():
         eval_dataset=eval_dataset,
         config=config,
         tokenizer=tokenizer,
+        use_8bit_optimizer=args.optim_8bit,
     )
     
     # Resume from checkpoint if specified (for curriculum continuation)
