@@ -30,6 +30,11 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "data"))
 
+
+class TrainingConfig:
+    """Placeholder to load checkpoints saved with training.TrainingConfig in __main__."""
+    pass
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -385,18 +390,9 @@ def main():
     if checkpoint_path.exists():
         logger.info(f"Loading checkpoint from {checkpoint_path}")
         try:
-            checkpoint = torch.load(checkpoint_path, map_location=args.device, weights_only=True)
+            checkpoint = torch.load(checkpoint_path, map_location=args.device, weights_only=False)
         except Exception:
-            try:
-                from training.train_mag import TrainingConfig
-                try:
-                    from torch.serialization import safe_globals
-                    with safe_globals([TrainingConfig]):
-                        checkpoint = torch.load(checkpoint_path, map_location=args.device, weights_only=True)
-                except Exception:
-                    checkpoint = torch.load(checkpoint_path, map_location=args.device, weights_only=False)
-            except Exception as exc:
-                raise RuntimeError("Failed to load checkpoint; TrainingConfig not available") from exc
+            checkpoint = torch.load(checkpoint_path, map_location=args.device, weights_only=True)
         model_state = model.state_dict()
         for name, param in checkpoint['trainable_state'].items():
             if name in model_state:
