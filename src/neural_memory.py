@@ -108,8 +108,8 @@ class NeuralMemory(nn.Module):
                     nn.init.eye_(layer.weight)
                     layer.weight.add_(torch.randn_like(layer.weight) * 0.01)
                 else:
-                    # Non-square: use orthogonal initialization
-                    nn.init.orthogonal_(layer.weight)
+                    # Non-square: use xavier instead of orthogonal (avoids LAPACK requirement)
+                    nn.init.xavier_uniform_(layer.weight)
                     layer.weight.mul_(0.1)
     
     @property
