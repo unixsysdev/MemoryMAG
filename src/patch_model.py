@@ -40,7 +40,7 @@ class Qwen3MAGConfig:
         memory_learnable_params: bool = True,
         memory_surprise_threshold: float = 0.0,
         memory_max_update_norm: Optional[float] = 1.0,
-        gate_init_bias: float = -2.0,
+        gate_init_bias: float = -4.0,
         n_persistent_tokens: int = 16,
         layers_to_patch: Optional[List[int]] = None,
         query_combine_mode: str = 'gate',

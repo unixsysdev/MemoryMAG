@@ -558,6 +558,7 @@ def main():
     parser.add_argument("--memory_weight_decay", type=float, default=0.01)
     parser.add_argument("--memory_surprise_threshold", type=float, default=0.0)
     parser.add_argument("--memory_max_update_norm", type=float, default=1.0)
+    parser.add_argument("--gate_init_bias", type=float, default=-4.0)
 
     # Gate regularization
     parser.add_argument("--gate_reg_weight", type=float, default=0.0)
@@ -649,6 +650,7 @@ def main():
         memory_learnable_params=True,
         memory_surprise_threshold=args.memory_surprise_threshold,
         memory_max_update_norm=args.memory_max_update_norm,
+        gate_init_bias=args.gate_init_bias,
         layers_to_patch=layers_to_patch if isinstance(layers_to_patch, list) else None,
     )
     
