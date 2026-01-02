@@ -150,6 +150,16 @@ class Qwen3MAGDecoderLayer(nn.Module):
     ):
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
+        base_dtype = hidden_states.dtype
+        for p in self.self_attn.parameters():
+            if p.is_floating_point():
+                base_dtype = p.dtype
+                break
+        if base_dtype == hidden_states.dtype:
+            for p in self.mlp.parameters():
+                if p.is_floating_point():
+                    base_dtype = p.dtype
+                    break
         # Get previous layer's LTM output from shared buffer (if available)
         prev_ltm_out = None
         if self.parent_model is not None and self.layer_idx > 0:
@@ -159,7 +169,7 @@ class Qwen3MAGDecoderLayer(nn.Module):
                     prev_ltm_out = self.parent_model._ltm_buffer[prev_idx]
                     break
         
-        dtype = hidden_states.dtype
+        dtype = base_dtype
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         
@@ -207,7 +217,9 @@ class Qwen3MAGDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        
+        if hidden_states.dtype != base_dtype:
+            hidden_states = hidden_states.to(dtype=base_dtype)
+
         return hidden_states
     
     def reset_memory(self):
