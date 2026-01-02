@@ -387,7 +387,7 @@ class Qwen3MAGModel(nn.Module):
         
         loss = None
         if labels is not None and logits is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
+            shift_logits = logits[..., :-1, :].contiguous().float()
             shift_labels = labels[..., 1:].contiguous()
             loss = nn.CrossEntropyLoss()(
                 shift_logits.view(-1, self.vocab_size),
