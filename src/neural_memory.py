@@ -192,6 +192,13 @@ class NeuralMemory(nn.Module):
         keys = self.conv_k(self.key_proj(hidden_states).transpose(1, 2))[:, :, :hidden_states.shape[1]].transpose(1, 2)
         values = self.conv_v(self.value_proj(hidden_states).transpose(1, 2))[:, :, :hidden_states.shape[1]].transpose(1, 2)
         
+        if weights is not None:
+            target_dtype = weights[0].dtype
+            if keys.dtype != target_dtype:
+                keys = keys.to(dtype=target_dtype)
+            if values.dtype != target_dtype:
+                values = values.to(dtype=target_dtype)
+
         # Memory reconstruction
         reconstructed = self.memory_forward(keys, weights)
         
@@ -319,12 +326,14 @@ class NeuralMemory(nn.Module):
         for chunk_start in range(0, seq_len, self.chunk_size):
             chunk_end = min(chunk_start + self.chunk_size, seq_len)
             chunk = hidden_states[:, chunk_start:chunk_end, :]
-            if update_dtype != chunk.dtype:
-                chunk = chunk.to(dtype=update_dtype)
+            proj_chunk = chunk
+            proj_dtype = self.key_proj.weight.dtype
+            if proj_chunk.dtype != proj_dtype:
+                proj_chunk = proj_chunk.to(dtype=proj_dtype)
             
             if update_memory:
                 # Compute surprise and gradients for this chunk
-                surprise, keys, values = self.compute_surprise(chunk, current_weights)
+                surprise, keys, values = self.compute_surprise(proj_chunk, current_weights)
                 
                 if return_surprise:
                     surprises.append(torch.nan_to_num(surprise.mean(dim=-1), nan=0.0, posinf=0.0, neginf=0.0))
@@ -360,7 +369,9 @@ class NeuralMemory(nn.Module):
                         current_weights[i] = (1 - alpha) * w + s_new
             
             # Retrieve using updated weights
-            q = self.conv_q(self.query_proj(chunk).transpose(1, 2))[:, :, :chunk.shape[1]].transpose(1, 2)
+            q = self.conv_q(self.query_proj(proj_chunk).transpose(1, 2))[:, :, :proj_chunk.shape[1]].transpose(1, 2)
+            if q.dtype != current_weights[0].dtype:
+                q = q.to(dtype=current_weights[0].dtype)
             output = self.memory_forward(q, current_weights)
             output = torch.nan_to_num(output, nan=0.0, posinf=0.0, neginf=0.0)
             outputs.append(output)
