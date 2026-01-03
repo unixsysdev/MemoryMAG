@@ -524,7 +524,7 @@ class Trainer:
         
         logger.info(f"Saved checkpoint to {checkpoint_dir}")
     
-    def load_checkpoint(self, checkpoint_path: str):
+    def load_checkpoint(self, checkpoint_path: str, load_optim_state: bool = True):
         """Load model checkpoint."""
         try:
             checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
@@ -537,8 +537,12 @@ class Trainer:
             if name in model_state:
                 model_state[name].copy_(param)
         
-        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state'])
+        if load_optim_state:
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+                self.scheduler.load_state_dict(checkpoint['scheduler_state'])
+            except Exception as exc:
+                logger.warning(f"Optimizer/scheduler state not loaded: {exc}. Continuing with fresh state.")
         self.global_step = checkpoint['global_step']
         
         logger.info(f"Loaded checkpoint from {checkpoint_path}")
@@ -598,6 +602,8 @@ def main():
     # Resume from previous checkpoint (for curriculum training)
     parser.add_argument("--resume_from", type=str, default=None,
                        help="Path to checkpoint dir to resume from (e.g., checkpoints/phase1/best)")
+    parser.add_argument("--reset_optimizer", action="store_true",
+                       help="Ignore optimizer/scheduler state when resuming")
     
     # Hardware
     parser.add_argument("--device", type=str, default="auto")
@@ -724,7 +730,7 @@ def main():
         checkpoint_file = Path(args.resume_from) / "checkpoint.pt"
         if checkpoint_file.exists():
             logger.info(f"Resuming from {args.resume_from}")
-            trainer.load_checkpoint(str(checkpoint_file))
+            trainer.load_checkpoint(str(checkpoint_file), load_optim_state=not args.reset_optimizer)
         else:
             logger.warning(f"Checkpoint not found at {checkpoint_file}, starting fresh")
     
