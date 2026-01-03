@@ -292,21 +292,19 @@ class Trainer:
 
     def _set_requires_grad_by_stage(self, stage: str):
         """Enable parameters for the given training stage."""
+        mag_keys = (".gate.", ".query_projector.", ".neural_memory.", ".memory_norm.", "persistent_memory")
         for name, param in self.model.named_parameters():
             if not (param.is_floating_point() or param.is_complex()):
                 param.requires_grad = False
                 continue
             name_lower = name.lower()
             if stage == "gates":
-                param.requires_grad = "gate" in name_lower
+                param.requires_grad = ".gate." in name_lower
             elif stage == "gates_queries":
-                param.requires_grad = ("gate" in name_lower) or ("query_projector" in name_lower)
+                param.requires_grad = (".gate." in name_lower) or (".query_projector." in name_lower)
             else:
                 # Full training for MAG components + persistent memory
-                param.requires_grad = any(
-                    key in name_lower
-                    for key in ("gate", "query_projector", "neural_memory", "memory_norm", "persistent_memory")
-                )
+                param.requires_grad = any(key in name_lower for key in mag_keys)
 
     def _apply_training_stage(self, stage: str):
         """Apply stage settings and reset optimizer/scheduler."""
