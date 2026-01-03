@@ -174,6 +174,7 @@ class NeedleBenchmark:
         query: str,
         expected_answer: str,
         max_new_tokens: int = 50,
+        decode_window: Optional[int] = None,
     ) -> NeedleTestResult:
         """Run a single needle test."""
         # Prepare input
@@ -193,26 +194,45 @@ class NeedleBenchmark:
         
         # Reset memory before generation
         self.model.reset_all_memory()
-        
+
+        # Pre-pass to update memory on the full context
+        _ = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+
         # Greedy decode via forward pass to enforce attention_window
         output_ids = input_ids
+        output_mask = attention_mask
+        if decode_window is not None and output_ids.shape[1] > decode_window:
+            output_ids = output_ids[:, -decode_window:]
+            output_mask = output_mask[:, -decode_window:]
+        generated_tokens = []
         for _ in range(max_new_tokens):
             outputs = self.model(
                 input_ids=output_ids,
-                attention_mask=attention_mask,
+                attention_mask=output_mask,
                 use_cache=False,
             )
             logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
             next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
             output_ids = torch.cat([output_ids, next_token], dim=-1)
-            attention_mask = torch.cat(
-                [attention_mask, torch.ones_like(next_token, device=attention_mask.device)], dim=-1
+            output_mask = torch.cat(
+                [output_mask, torch.ones_like(next_token, device=output_mask.device)], dim=-1
             )
+            generated_tokens.append(next_token)
+            if decode_window is not None and output_ids.shape[1] > decode_window:
+                output_ids = output_ids[:, -decode_window:]
+                output_mask = output_mask[:, -decode_window:]
             if next_token.item() == self.tokenizer.eos_token_id:
                 break
         
         # Decode response
-        generated_ids = output_ids[0, input_ids.shape[1]:]
+        if generated_tokens:
+            generated_ids = torch.cat(generated_tokens, dim=-1)[0]
+        else:
+            generated_ids = input_ids.new_empty((0,), dtype=input_ids.dtype)
         model_answer = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
         
         # Check correctness (exact match or contains)
@@ -236,6 +256,8 @@ class NeedleBenchmark:
         context_lengths: List[int] = [2000, 4000, 8000, 16000, 32000],
         needle_positions: List[float] = [0.1, 0.25, 0.5, 0.75, 0.9],
         n_trials: int = 5,
+        max_new_tokens: int = 50,
+        decode_window: Optional[int] = None,
     ) -> Dict:
         """
         Run full benchmark suite.
@@ -272,7 +294,13 @@ class NeedleBenchmark:
                     
                     # Run test
                     try:
-                        result = self.run_single_test(context, query, expected)
+                        result = self.run_single_test(
+                            context,
+                            query,
+                            expected,
+                            max_new_tokens=max_new_tokens,
+                            decode_window=decode_window,
+                        )
                         result.needle_position = position
                         
                         # Update statistics
@@ -360,6 +388,9 @@ def main():
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max_new_tokens", type=int, default=50)
+    parser.add_argument("--decode_window", type=int, default=None,
+                        help="Limit decoding context length (defaults to attention_window)")
     parser.add_argument("--load_in_8bit", action="store_true", help="Load base model in 8-bit (bitsandbytes)")
     parser.add_argument("--load_in_4bit", action="store_true", help="Load base model in 4-bit (bitsandbytes)")
     parser.add_argument("--memory_layers", type=int, default=2)
@@ -442,9 +473,15 @@ def main():
     
     # Run benchmark
     benchmark = NeedleBenchmark(model, tokenizer, device=args.device)
+    decode_window = args.decode_window
+    if decode_window is None:
+        decode_window = args.attention_window
+
     results = benchmark.run_benchmark(
         context_lengths=context_lengths,
         n_trials=args.n_trials,
+        max_new_tokens=args.max_new_tokens,
+        decode_window=decode_window,
     )
     
     # Print and save results
