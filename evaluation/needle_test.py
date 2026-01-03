@@ -358,6 +358,8 @@ def main():
     parser.add_argument("--d_memory", type=int, default=None)
     parser.add_argument("--chunk_size", type=int, default=64)
     parser.add_argument("--n_persistent_tokens", type=int, default=16)
+    parser.add_argument("--attention_window", type=int, default=None,
+                        help="Limit attention to this many previous tokens (forces memory use)")
     parser.add_argument("--patch_layers", type=str, default="all",
                         help="Which layers to patch: 'all', 'every_N', 'last_N', or comma-separated indices")
     parser.add_argument("--attn_implementation", type=str, default="eager",
@@ -403,6 +405,7 @@ def main():
         d_memory=args.d_memory,
         chunk_size=args.chunk_size,
         n_persistent_tokens=args.n_persistent_tokens,
+        attention_window=args.attention_window,
         layers_to_patch=layers_to_patch,
     )
     model = patch_qwen3_with_mag(

@@ -34,6 +34,7 @@ class Qwen3MAGConfig:
         d_memory: Optional[int] = None,
         memory_layers: int = 2,
         chunk_size: int = 64,
+        attention_window: Optional[int] = None,
         memory_lr: float = 0.01,
         memory_momentum: float = 0.9,
         memory_weight_decay: float = 0.01,
@@ -50,6 +51,7 @@ class Qwen3MAGConfig:
         self.d_memory = d_memory
         self.memory_layers = memory_layers
         self.chunk_size = chunk_size
+        self.attention_window = attention_window
         self.memory_lr = memory_lr
         self.memory_momentum = memory_momentum
         self.memory_weight_decay = memory_weight_decay
@@ -301,6 +303,29 @@ class Qwen3MAGModel(nn.Module):
                 decoder_layers[idx] = mag_layer
             else:
                 self.mag_layers.append(None)
+
+    def _build_attention_window_mask(
+        self,
+        attention_mask: Optional[torch.Tensor],
+        seq_len: int,
+        window: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        idx = torch.arange(seq_len, device=device)
+        i = idx[:, None]
+        j = idx[None, :]
+        window_start = i - (window - 1)
+        allowed = (j <= i) & (j >= window_start)
+        if attention_mask is not None:
+            src_mask = attention_mask[:, None, None, :].bool()
+            allowed = allowed[None, None, :, :].expand(attention_mask.size(0), -1, -1, -1)
+            allowed = allowed & src_mask
+        else:
+            allowed = allowed[None, None, :, :]
+        attn_mask = torch.zeros_like(allowed, dtype=dtype)
+        attn_mask = attn_mask.masked_fill(~allowed, torch.finfo(dtype).min)
+        return attn_mask
     
     def _freeze_base_components(self):
         if self.mag_config.freeze_embeddings:
@@ -357,6 +382,15 @@ class Qwen3MAGModel(nn.Module):
                     [persistent_positions, position_ids + self.mag_config.n_persistent_tokens],
                     dim=1,
                 )
+
+        if self.mag_config.attention_window is not None:
+            attention_mask = self._build_attention_window_mask(
+                attention_mask=attention_mask,
+                seq_len=inputs_embeds.shape[1],
+                window=self.mag_config.attention_window,
+                dtype=inputs_embeds.dtype,
+                device=inputs_embeds.device,
+            )
         
         target_dtype = inputs_embeds.dtype
         lm_weight = getattr(self.base_model.lm_head, "weight", None)

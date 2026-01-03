@@ -61,6 +61,7 @@ class TrainingConfig:
     d_memory: Optional[int] = None
     n_persistent_tokens: int = 16
     chunk_size: int = 64
+    attention_window: Optional[int] = None
     memory_lr: float = 0.01
     memory_momentum: float = 0.9
     memory_weight_decay: float = 0.01
@@ -556,6 +557,8 @@ def main():
     parser.add_argument("--memory_layers", type=int, default=2)
     parser.add_argument("--n_persistent_tokens", type=int, default=16)
     parser.add_argument("--chunk_size", type=int, default=64)
+    parser.add_argument("--attention_window", type=int, default=None,
+                       help="Limit attention to this many previous tokens (forces memory use)")
     parser.add_argument("--memory_lr", type=float, default=0.01)
     parser.add_argument("--memory_momentum", type=float, default=0.9)
     parser.add_argument("--memory_weight_decay", type=float, default=0.01)
@@ -647,6 +650,7 @@ def main():
         memory_layers=args.memory_layers,
         n_persistent_tokens=args.n_persistent_tokens,
         chunk_size=args.chunk_size,
+        attention_window=args.attention_window,
         memory_lr=args.memory_lr,
         memory_momentum=args.memory_momentum,
         memory_weight_decay=args.memory_weight_decay,
