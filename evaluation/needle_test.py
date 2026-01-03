@@ -175,6 +175,7 @@ class NeedleBenchmark:
         expected_answer: str,
         max_new_tokens: int = 50,
         decode_window: Optional[int] = None,
+        eval_mode: str = "decode",
     ) -> NeedleTestResult:
         """Run a single needle test."""
         # Prepare input
@@ -195,51 +196,76 @@ class NeedleBenchmark:
         # Reset memory before generation
         self.model.reset_all_memory()
 
-        # Pre-pass to update memory on the full context
-        _ = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-        )
+        if eval_mode == "teacher_forcing":
+            answer_ids = self.tokenizer(expected_answer, add_special_tokens=False)["input_ids"]
+            if not answer_ids:
+                answer_ids = [self.tokenizer.eos_token_id]
+            answer_tensor = torch.tensor([answer_ids], device=self.device, dtype=input_ids.dtype)
+            tf_input_ids = torch.cat([input_ids, answer_tensor], dim=1)
+            tf_mask = torch.cat(
+                [attention_mask, torch.ones_like(answer_tensor, device=attention_mask.device)], dim=1
+            )
 
-        # Greedy decode via forward pass to enforce attention_window
-        output_ids = input_ids
-        output_mask = attention_mask
-        if decode_window is not None and output_ids.shape[1] > decode_window:
-            output_ids = output_ids[:, -decode_window:]
-            output_mask = output_mask[:, -decode_window:]
-        generated_tokens = []
-        for _ in range(max_new_tokens):
             outputs = self.model(
-                input_ids=output_ids,
-                attention_mask=output_mask,
+                input_ids=tf_input_ids,
+                attention_mask=tf_mask,
                 use_cache=False,
             )
             logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-            next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-            output_ids = torch.cat([output_ids, next_token], dim=-1)
-            output_mask = torch.cat(
-                [output_mask, torch.ones_like(next_token, device=output_mask.device)], dim=-1
+            pred_ids = torch.argmax(logits, dim=-1)
+            start = input_ids.shape[1] - 1
+            end = start + answer_tensor.shape[1]
+            pred_answer = pred_ids[:, start:end]
+            correct = torch.equal(pred_answer, answer_tensor)
+            model_answer = self.tokenizer.decode(pred_answer[0], skip_special_tokens=True).strip()
+            generated_ids = pred_answer[0]
+        else:
+            # Pre-pass to update memory on the full context
+            _ = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
             )
-            generated_tokens.append(next_token)
+
+            # Greedy decode via forward pass to enforce attention_window
+            output_ids = input_ids
+            output_mask = attention_mask
             if decode_window is not None and output_ids.shape[1] > decode_window:
                 output_ids = output_ids[:, -decode_window:]
                 output_mask = output_mask[:, -decode_window:]
-            if next_token.item() == self.tokenizer.eos_token_id:
-                break
-        
-        # Decode response
-        if generated_tokens:
-            generated_ids = torch.cat(generated_tokens, dim=-1)[0]
-        else:
-            generated_ids = input_ids.new_empty((0,), dtype=input_ids.dtype)
-        model_answer = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+            generated_tokens = []
+            for _ in range(max_new_tokens):
+                outputs = self.model(
+                    input_ids=output_ids,
+                    attention_mask=output_mask,
+                    use_cache=False,
+                )
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+                next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+                output_ids = torch.cat([output_ids, next_token], dim=-1)
+                output_mask = torch.cat(
+                    [output_mask, torch.ones_like(next_token, device=output_mask.device)], dim=-1
+                )
+                generated_tokens.append(next_token)
+                if decode_window is not None and output_ids.shape[1] > decode_window:
+                    output_ids = output_ids[:, -decode_window:]
+                    output_mask = output_mask[:, -decode_window:]
+                if next_token.item() == self.tokenizer.eos_token_id:
+                    break
+
+            # Decode response
+            if generated_tokens:
+                generated_ids = torch.cat(generated_tokens, dim=-1)[0]
+            else:
+                generated_ids = input_ids.new_empty((0,), dtype=input_ids.dtype)
+            model_answer = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
         
         # Check correctness (exact match or contains)
-        correct = (
-            expected_answer.lower() in model_answer.lower() or
-            model_answer.lower().startswith(expected_answer.lower())
-        )
+        if eval_mode != "teacher_forcing":
+            correct = (
+                expected_answer.lower() in model_answer.lower() or
+                model_answer.lower().startswith(expected_answer.lower())
+            )
         
         return NeedleTestResult(
             context_length=context_length,
@@ -258,6 +284,7 @@ class NeedleBenchmark:
         n_trials: int = 5,
         max_new_tokens: int = 50,
         decode_window: Optional[int] = None,
+        eval_mode: str = "decode",
     ) -> Dict:
         """
         Run full benchmark suite.
@@ -300,6 +327,7 @@ class NeedleBenchmark:
                             expected,
                             max_new_tokens=max_new_tokens,
                             decode_window=decode_window,
+                            eval_mode=eval_mode,
                         )
                         result.needle_position = position
                         
@@ -391,6 +419,9 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=50)
     parser.add_argument("--decode_window", type=int, default=None,
                         help="Limit decoding context length (defaults to attention_window)")
+    parser.add_argument("--eval_mode", type=str, default="decode",
+                        choices=["decode", "teacher_forcing"],
+                        help="decode=greedy generation, teacher_forcing=fast logit check")
     parser.add_argument("--load_in_8bit", action="store_true", help="Load base model in 8-bit (bitsandbytes)")
     parser.add_argument("--load_in_4bit", action="store_true", help="Load base model in 4-bit (bitsandbytes)")
     parser.add_argument("--memory_layers", type=int, default=2)
@@ -482,6 +513,7 @@ def main():
         n_trials=args.n_trials,
         max_new_tokens=args.max_new_tokens,
         decode_window=decode_window,
+        eval_mode=args.eval_mode,
     )
     
     # Print and save results
