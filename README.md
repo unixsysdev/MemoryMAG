@@ -281,6 +281,32 @@ You can cap attention to a fixed window while still feeding long contexts:
 2. MIRAS: A Unified Framework for Sequence Modeling (Google Research, 2024)
 3. [Google Research Blog](https://research.google/blog/titans-miras-helping-ai-have-long-term-memory/)
 
+## Results (Current Branch)
+
+### Training Run (Phase 1)
+- Config: `max_seq_length=8192`, `attention_window=4096`, `patch_layers=every_4`, `memory_layers=1`, `chunk_size=16`, `n_persistent_tokens=0`
+- Dataset: `data/hash_hop_16k.jsonl` (4,000 samples)
+- Batch: `batch_size=2`, `gradient_accumulation_steps=4`, `num_epochs=1`
+- Optim: `learning_rate=1e-4`, `optim_8bit`, `gradient_checkpointing`
+- Result: loss trended down to ~3.5 by step 500
+
+### Diagnostics Snapshot
+- Gate analysis: layers 20 and 24 show active gates (std > 0.01); earlier layers remain near-zero (expected with `gate_init_bias=-4.0`)
+- Memory analysis: weight norms stable (~49.7) across patched layers
+
+### Needle Test (Attention Window Enforced)
+- Eval mode: teacher-forcing (`--eval_mode teacher_forcing`)
+- Context length: 8192 with `attention_window=4096`
+- Result: 0% for checkpoint and 0% baseline (/dev/null)
+
+### Sanity Check (Generation)
+- MAG-patched model with checkpoint generates normal text (no "pipe" artifacts)
+
+### Next Steps
+- Increase training compute (more steps/epochs, larger dataset)
+- Consider `memory_layers=2` for capacity once stable
+- Revisit gate bias/regularization after longer training
+
 ## License
 
 MIT
