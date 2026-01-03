@@ -30,6 +30,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+class TrainingConfig:
+    """Shim for loading checkpoints saved with TrainingConfig pickles."""
+    pass
+
+
 @dataclass
 class DiagnosticResult:
     """Result from diagnostic analysis."""
