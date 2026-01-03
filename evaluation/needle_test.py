@@ -194,14 +194,22 @@ class NeedleBenchmark:
         # Reset memory before generation
         self.model.reset_all_memory()
         
-        # Generate
-        output_ids = self.model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=self.tokenizer.pad_token_id,
-        )
+        # Greedy decode via forward pass to enforce attention_window
+        output_ids = input_ids
+        for _ in range(max_new_tokens):
+            outputs = self.model(
+                input_ids=output_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
+            logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+            next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            output_ids = torch.cat([output_ids, next_token], dim=-1)
+            attention_mask = torch.cat(
+                [attention_mask, torch.ones_like(next_token, device=attention_mask.device)], dim=-1
+            )
+            if next_token.item() == self.tokenizer.eos_token_id:
+                break
         
         # Decode response
         generated_ids = output_ids[0, input_ids.shape[1]:]
