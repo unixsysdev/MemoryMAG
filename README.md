@@ -68,6 +68,7 @@ config = Qwen3MAGConfig(
     memory_layers=2,           # Depth of memory MLP
     n_persistent_tokens=16,    # Learned prefix tokens
     chunk_size=64,             # Memory update chunk size
+    attention_window=None,     # Limit attention span to force memory use
 )
 
 # Load and patch model
@@ -114,7 +115,20 @@ python training/train_mag.py \
     --data_path data/hash_hop_16k.jsonl \
     --output_dir checkpoints/phase1 \
     --learning_rate 1e-4 \
-    --num_epochs 3
+    --num_epochs 3 \
+    --patch_layers every_4 \
+    --memory_layers 1 \
+    --chunk_size 16 \
+    --n_persistent_tokens 0 \
+    --gate_init_bias -4.0 \
+    --memory_lr 1e-4 \
+    --memory_momentum 0.9 \
+    --memory_weight_decay 0.01 \
+    --memory_max_update_norm 0.1 \
+    --memory_surprise_threshold 0.0 \
+    --attention_window 4096 \
+    --gradient_checkpointing \
+    --optim_8bit
 
 # Phase 2: Dependency (builds on Phase 1 checkpoint)
 python training/train_mag.py \
@@ -135,6 +149,16 @@ python training/train_mag.py \
     --num_epochs 3
 ```
 
+All phases support the same core MAG flags:
+
+- `--attention_window` (force memory use by limiting attention)
+- `--patch_layers` (e.g., `every_4`, `last_1`, or indices)
+- `--memory_layers`, `--chunk_size`, `--n_persistent_tokens`
+- `--gate_init_bias`, `--gate_reg_weight`, `--gate_saturation_threshold`, `--gate_min_std`
+- `--memory_lr`, `--memory_momentum`, `--memory_weight_decay`
+- `--memory_max_update_norm`, `--memory_surprise_threshold`
+- `--gradient_checkpointing`, `--optim_8bit`, `--load_in_8bit`, `--load_in_4bit`
+
 Checkpoints chain automatically - each phase builds on the previous phase's learned weights.
 
 ### 4. Evaluate
@@ -143,7 +167,13 @@ Checkpoints chain automatically - each phase builds on the previous phase's lear
 # Needle-in-haystack benchmark
 python evaluation/needle_test.py \
     --checkpoint checkpoints/best \
-    --context_lengths 2000,4000,8000,16000
+    --context_lengths 2000,4000,8000,16000 \
+    --patch_layers every_4 \
+    --memory_layers 1 \
+    --chunk_size 16 \
+    --n_persistent_tokens 0 \
+    --attention_window 4096 \
+    --attn_implementation sdpa
 
 # Code completion evaluation
 python evaluation/code_completion.py \
@@ -226,6 +256,13 @@ Learns when to use attention vs. memory:
 - Starts biased toward attention (gate ≈ 0)
 - Opens on tokens requiring long-range retrieval
 - Per-layer, per-token decisions
+
+### Attention Window (Memory Pressure)
+
+You can cap attention to a fixed window while still feeding long contexts:
+
+- `attention_window = 4096` means attention only sees the last 4096 tokens
+- Memory still sees the full sequence, forcing retrieval for out-of-window facts
 
 ## Hardware Requirements
 

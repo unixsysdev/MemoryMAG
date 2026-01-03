@@ -169,10 +169,12 @@ We are not just training next-token prediction - we are training the model to **
 1. **BPTT-through-TTT**: Backpropagation Through Test-Time Training
    - The final prediction loss must flow back through the retrieval step
    - This teaches query projectors: "To reduce loss, you should have generated THIS query at layer 20"
+   - **Stop-gradient fast updates**: Fast-weight updates are applied during the forward pass under `no_grad` for stability; gradients still flow through retrieval and gating
 
 2. **Memory Pressure**: Data where local attention is insufficient
    - Forces gradients to flow through the LTM branch
    - Teaches the gate to open when memory is needed
+   - Can be enforced by limiting attention to a fixed window during training (e.g., 4k)
 
 ### 3.2 Trainable vs Frozen Parameters
 
@@ -191,12 +193,11 @@ We are not just training next-token prediction - we are training the model to **
 # Primary: Standard language modeling loss
 L_LM = CrossEntropy(predictions, targets)
 
-# Secondary: Contrastive alignment loss
-# Minimizes distance between query vector and memory-weight distortion
-L_align = -cos_similarity(query_vector, memory_gradient)
+# Optional: Gate regularization (prevents collapse)
+L_gate = gate_regularizer(gate_values)
 
 # Total loss
-L_total = L_LM + λ * L_align
+L_total = L_LM + λ_gate * L_gate
 ```
 
 ### 3.4 Training Curriculum
