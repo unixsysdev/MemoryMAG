@@ -526,7 +526,10 @@ class Trainer:
     
     def load_checkpoint(self, checkpoint_path: str):
         """Load model checkpoint."""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        except Exception:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
         
         # Load trainable parameters
         model_state = self.model.state_dict()
