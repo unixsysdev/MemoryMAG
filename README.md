@@ -307,6 +307,12 @@ You can cap attention to a fixed window while still feeding long contexts:
 - Consider `memory_layers=2` for capacity once stable
 - Revisit gate bias/regularization after longer training
 
+### Why This Failed (Critical Notes)
+- Too few optimization steps for random-hash retrieval to shape memory usage
+- Gates stayed near zero in early layers, starving the memory path of gradient
+- Memory config was conservative (`memory_layers=1`, larger chunking), reducing update strength
+- Evaluation metric is strict exact-match; any near-miss counts as 0
+
 ## License
 
 MIT
