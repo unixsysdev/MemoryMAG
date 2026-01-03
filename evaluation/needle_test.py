@@ -30,6 +30,11 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "data"))
 
+
+class TrainingConfig:
+    """Placeholder to load checkpoints saved with training.TrainingConfig in __main__."""
+    pass
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -169,6 +174,8 @@ class NeedleBenchmark:
         query: str,
         expected_answer: str,
         max_new_tokens: int = 50,
+        decode_window: Optional[int] = None,
+        eval_mode: str = "decode",
     ) -> NeedleTestResult:
         """Run a single needle test."""
         # Prepare input
@@ -188,25 +195,77 @@ class NeedleBenchmark:
         
         # Reset memory before generation
         self.model.reset_all_memory()
-        
-        # Generate
-        output_ids = self.model.base_model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=self.tokenizer.pad_token_id,
-        )
-        
-        # Decode response
-        generated_ids = output_ids[0, input_ids.shape[1]:]
-        model_answer = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+        if eval_mode == "teacher_forcing":
+            answer_ids = self.tokenizer(expected_answer, add_special_tokens=False)["input_ids"]
+            if not answer_ids:
+                answer_ids = [self.tokenizer.eos_token_id]
+            answer_tensor = torch.tensor([answer_ids], device=self.device, dtype=input_ids.dtype)
+            tf_input_ids = torch.cat([input_ids, answer_tensor], dim=1)
+            tf_mask = torch.cat(
+                [attention_mask, torch.ones_like(answer_tensor, device=attention_mask.device)], dim=1
+            )
+
+            outputs = self.model(
+                input_ids=tf_input_ids,
+                attention_mask=tf_mask,
+                use_cache=False,
+            )
+            logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+            pred_ids = torch.argmax(logits, dim=-1)
+            start = input_ids.shape[1] - 1
+            end = start + answer_tensor.shape[1]
+            pred_answer = pred_ids[:, start:end]
+            correct = torch.equal(pred_answer, answer_tensor)
+            model_answer = self.tokenizer.decode(pred_answer[0], skip_special_tokens=True).strip()
+            generated_ids = pred_answer[0]
+        else:
+            # Pre-pass to update memory on the full context
+            _ = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
+
+            # Greedy decode via forward pass to enforce attention_window
+            output_ids = input_ids
+            output_mask = attention_mask
+            if decode_window is not None and output_ids.shape[1] > decode_window:
+                output_ids = output_ids[:, -decode_window:]
+                output_mask = output_mask[:, -decode_window:]
+            generated_tokens = []
+            for _ in range(max_new_tokens):
+                outputs = self.model(
+                    input_ids=output_ids,
+                    attention_mask=output_mask,
+                    use_cache=False,
+                )
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+                next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+                output_ids = torch.cat([output_ids, next_token], dim=-1)
+                output_mask = torch.cat(
+                    [output_mask, torch.ones_like(next_token, device=output_mask.device)], dim=-1
+                )
+                generated_tokens.append(next_token)
+                if decode_window is not None and output_ids.shape[1] > decode_window:
+                    output_ids = output_ids[:, -decode_window:]
+                    output_mask = output_mask[:, -decode_window:]
+                if next_token.item() == self.tokenizer.eos_token_id:
+                    break
+
+            # Decode response
+            if generated_tokens:
+                generated_ids = torch.cat(generated_tokens, dim=-1)[0]
+            else:
+                generated_ids = input_ids.new_empty((0,), dtype=input_ids.dtype)
+            model_answer = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
         
         # Check correctness (exact match or contains)
-        correct = (
-            expected_answer.lower() in model_answer.lower() or
-            model_answer.lower().startswith(expected_answer.lower())
-        )
+        if eval_mode != "teacher_forcing":
+            correct = (
+                expected_answer.lower() in model_answer.lower() or
+                model_answer.lower().startswith(expected_answer.lower())
+            )
         
         return NeedleTestResult(
             context_length=context_length,
@@ -223,6 +282,9 @@ class NeedleBenchmark:
         context_lengths: List[int] = [2000, 4000, 8000, 16000, 32000],
         needle_positions: List[float] = [0.1, 0.25, 0.5, 0.75, 0.9],
         n_trials: int = 5,
+        max_new_tokens: int = 50,
+        decode_window: Optional[int] = None,
+        eval_mode: str = "decode",
     ) -> Dict:
         """
         Run full benchmark suite.
@@ -259,7 +321,14 @@ class NeedleBenchmark:
                     
                     # Run test
                     try:
-                        result = self.run_single_test(context, query, expected)
+                        result = self.run_single_test(
+                            context,
+                            query,
+                            expected,
+                            max_new_tokens=max_new_tokens,
+                            decode_window=decode_window,
+                            eval_mode=eval_mode,
+                        )
                         result.needle_position = position
                         
                         # Update statistics
@@ -347,6 +416,24 @@ def main():
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max_new_tokens", type=int, default=50)
+    parser.add_argument("--decode_window", type=int, default=None,
+                        help="Limit decoding context length (defaults to attention_window)")
+    parser.add_argument("--eval_mode", type=str, default="decode",
+                        choices=["decode", "teacher_forcing"],
+                        help="decode=greedy generation, teacher_forcing=fast logit check")
+    parser.add_argument("--load_in_8bit", action="store_true", help="Load base model in 8-bit (bitsandbytes)")
+    parser.add_argument("--load_in_4bit", action="store_true", help="Load base model in 4-bit (bitsandbytes)")
+    parser.add_argument("--memory_layers", type=int, default=2)
+    parser.add_argument("--d_memory", type=int, default=None)
+    parser.add_argument("--chunk_size", type=int, default=64)
+    parser.add_argument("--n_persistent_tokens", type=int, default=16)
+    parser.add_argument("--attention_window", type=int, default=None,
+                        help="Limit attention to this many previous tokens (forces memory use)")
+    parser.add_argument("--patch_layers", type=str, default="all",
+                        help="Which layers to patch: 'all', 'every_N', 'last_N', or comma-separated indices")
+    parser.add_argument("--attn_implementation", type=str, default="eager",
+                        choices=["eager", "sdpa", "flash_attention_2"])
     
     args = parser.parse_args()
     
@@ -357,7 +444,7 @@ def main():
     context_lengths = [int(x) for x in args.context_lengths.split(",")]
     
     # Load model
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, AutoConfig
     from src.patch_model import patch_qwen3_with_mag, Qwen3MAGConfig
     
     logger.info(f"Loading model...")
@@ -366,18 +453,48 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    config = Qwen3MAGConfig()
+    if args.load_in_8bit and args.load_in_4bit:
+        raise ValueError("Choose only one of --load_in_8bit or --load_in_4bit")
+
+    # Parse layers_to_patch
+    layers_to_patch = None
+    if args.patch_layers != "all":
+        if args.patch_layers.startswith("every_"):
+            n = int(args.patch_layers.split("_")[1])
+            model_config = AutoConfig.from_pretrained(args.model_name)
+            layers_to_patch = list(range(0, model_config.num_hidden_layers, n))
+        elif args.patch_layers.startswith("last_"):
+            n = int(args.patch_layers.split("_")[1])
+            model_config = AutoConfig.from_pretrained(args.model_name)
+            layers_to_patch = list(range(model_config.num_hidden_layers - n, model_config.num_hidden_layers))
+        else:
+            layers_to_patch = [int(x.strip()) for x in args.patch_layers.split(",")]
+
+    config = Qwen3MAGConfig(
+        memory_layers=args.memory_layers,
+        d_memory=args.d_memory,
+        chunk_size=args.chunk_size,
+        n_persistent_tokens=args.n_persistent_tokens,
+        attention_window=args.attention_window,
+        layers_to_patch=layers_to_patch,
+    )
     model = patch_qwen3_with_mag(
         model_name_or_path=args.model_name,
         config=config,
         device=args.device,
+        attn_implementation=args.attn_implementation,
+        load_in_8bit=args.load_in_8bit,
+        load_in_4bit=args.load_in_4bit,
     )
     
     # Load checkpoint
     checkpoint_path = Path(args.checkpoint) / "checkpoint.pt"
     if checkpoint_path.exists():
         logger.info(f"Loading checkpoint from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=args.device)
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=args.device, weights_only=False)
+        except Exception:
+            checkpoint = torch.load(checkpoint_path, map_location=args.device, weights_only=True)
         model_state = model.state_dict()
         for name, param in checkpoint['trainable_state'].items():
             if name in model_state:
@@ -387,9 +504,16 @@ def main():
     
     # Run benchmark
     benchmark = NeedleBenchmark(model, tokenizer, device=args.device)
+    decode_window = args.decode_window
+    if decode_window is None:
+        decode_window = args.attention_window
+
     results = benchmark.run_benchmark(
         context_lengths=context_lengths,
         n_trials=args.n_trials,
+        max_new_tokens=args.max_new_tokens,
+        decode_window=decode_window,
+        eval_mode=args.eval_mode,
     )
     
     # Print and save results

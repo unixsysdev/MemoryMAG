@@ -61,6 +61,22 @@ class TrainingConfig:
     d_memory: Optional[int] = None
     n_persistent_tokens: int = 16
     chunk_size: int = 64
+    attention_window: Optional[int] = None
+    memory_lr: float = 0.01
+    memory_momentum: float = 0.9
+    memory_weight_decay: float = 0.01
+    memory_learnable_params: bool = True
+    memory_surprise_threshold: float = 0.0
+    memory_max_update_norm: Optional[float] = 1.0
+
+    # Gate regularization
+    gate_reg_weight: float = 0.0
+    gate_saturation_threshold: float = 0.98
+    gate_min_std: float = 0.0
+
+    # Staged training (optimization steps)
+    stage1_steps: int = 0  # gates only
+    stage2_steps: int = 0  # gates + queries
     
     # Training
     num_epochs: int = 3
@@ -122,34 +138,35 @@ class MemoryMAGDataset(Dataset):
         # Get input and target
         input_text = sample["input"]
         target_text = sample["target"]
-        
-        # Tokenize
-        # For causal LM, we concatenate input and target
-        full_text = input_text + " " + target_text
-        
-        encoding = self.tokenizer(
-            full_text,
-            truncation=True,
-            max_length=self.max_seq_length,
-            return_tensors="pt",
-        )
-        
-        input_ids = encoding["input_ids"].squeeze(0)
-        attention_mask = encoding["attention_mask"].squeeze(0)
-        
-        # Create labels (shifted by 1 for causal LM)
-        labels = input_ids.clone()
-        
-        # Mask input portion (only compute loss on target)
-        input_encoding = self.tokenizer(
-            input_text,
-            truncation=True,
-            max_length=self.max_seq_length,
-        )
-        input_len = len(input_encoding["input_ids"])
-        
-        # Set labels to -100 for input tokens (ignored in loss)
-        labels[:input_len] = -100
+
+        # Tokenize separately to preserve target tokens
+        input_ids = self.tokenizer(input_text, add_special_tokens=False)["input_ids"]
+        target_ids = self.tokenizer(target_text, add_special_tokens=False)["input_ids"]
+        if not target_ids:
+            target_ids = [self.tokenizer.eos_token_id]
+
+        space_ids = self.tokenizer(" ", add_special_tokens=False)["input_ids"]
+
+        available = self.max_seq_length - len(space_ids) - len(target_ids)
+        if available < 0:
+            target_keep = max(1, self.max_seq_length - len(space_ids))
+            target_ids = target_ids[:target_keep]
+            available = self.max_seq_length - len(space_ids) - len(target_ids)
+
+        if len(input_ids) > available:
+            input_ids = input_ids[-available:] if available > 0 else []
+
+        full_ids = input_ids + space_ids + target_ids
+        attention_mask = [1] * len(full_ids)
+
+        labels = [-100] * (len(input_ids) + len(space_ids)) + target_ids
+        labels = labels[:len(full_ids)]
+        if len(labels) < len(full_ids):
+            labels += [-100] * (len(full_ids) - len(labels))
+
+        input_ids = torch.tensor(full_ids, dtype=torch.long)
+        attention_mask = torch.tensor(attention_mask, dtype=torch.long)
+        labels = torch.tensor(labels, dtype=torch.long)
         
         return {
             "input_ids": input_ids,
@@ -205,9 +222,21 @@ class Trainer:
             self.device = torch.device(config.device)
         
         self.model = self.model.to(self.device)
+        if hasattr(self.model, "base_model") and hasattr(self.model.base_model, "config"):
+            self.model.base_model.config.use_cache = False
         
+        self.stage1_end = config.stage1_steps
+        self.stage2_end = config.stage1_steps + config.stage2_steps
+        self.current_stage = None
+        if self.stage1_end > 0:
+            initial_stage = "gates"
+        elif self.stage2_end > 0:
+            initial_stage = "gates_queries"
+        else:
+            initial_stage = "full"
+        self._set_requires_grad_by_stage(initial_stage)
+
         # Setup optimizer (only for trainable parameters)
-        trainable_params = model.get_trainable_parameters()
         param_groups = get_parameter_groups(model, config.learning_rate, config.weight_decay)
         
         # Filter to only trainable parameters
@@ -229,6 +258,8 @@ class Trainer:
         # Setup scheduler
         total_steps = (len(train_dataset) // config.batch_size // config.gradient_accumulation_steps) * config.num_epochs
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=total_steps)
+        self.current_stage = initial_stage
+        logger.info(f"Training stage set to: {initial_stage}")
         
         # Setup data loader
         self.train_loader = DataLoader(
@@ -258,6 +289,91 @@ class Trainer:
         
         # Create output directory
         os.makedirs(config.output_dir, exist_ok=True)
+
+    def _set_requires_grad_by_stage(self, stage: str):
+        """Enable parameters for the given training stage."""
+        for name, param in self.model.named_parameters():
+            if not (param.is_floating_point() or param.is_complex()):
+                param.requires_grad = False
+                continue
+            name_lower = name.lower()
+            if stage == "gates":
+                param.requires_grad = "gate" in name_lower
+            elif stage == "gates_queries":
+                param.requires_grad = ("gate" in name_lower) or ("query_projector" in name_lower)
+            else:
+                # Full training for MAG components + persistent memory
+                param.requires_grad = any(
+                    key in name_lower
+                    for key in ("gate", "query_projector", "neural_memory", "memory_norm", "persistent_memory")
+                )
+
+    def _apply_training_stage(self, stage: str):
+        """Apply stage settings and reset optimizer/scheduler."""
+        if stage == self.current_stage:
+            return
+        self._set_requires_grad_by_stage(stage)
+
+        param_groups = get_parameter_groups(self.model, self.config.learning_rate, self.config.weight_decay)
+        for group in param_groups:
+            group['params'] = [p for p in group['params'] if p.requires_grad]
+
+        if isinstance(self.optimizer, AdamW):
+            self.optimizer = AdamW(param_groups)
+        else:
+            # Recreate optimizer for other types (e.g., 8-bit) without preserving state
+            try:
+                import bitsandbytes as bnb
+                if isinstance(self.optimizer, bnb.optim.AdamW8bit):
+                    self.optimizer = bnb.optim.AdamW8bit(param_groups)
+                else:
+                    self.optimizer = AdamW(param_groups)
+            except Exception:
+                self.optimizer = AdamW(param_groups)
+
+        total_steps = (len(self.train_dataset) // self.config.batch_size // self.config.gradient_accumulation_steps) * self.config.num_epochs
+        if total_steps > 0:
+            self.scheduler = CosineAnnealingLR(self.optimizer, T_max=total_steps)
+        self.current_stage = stage
+        logger.info(f"Training stage set to: {stage}")
+
+    def _maybe_update_stage(self):
+        """Update training stage based on global_step."""
+        if self.stage1_end <= 0 and self.stage2_end <= 0:
+            stage = "full"
+        elif self.global_step < self.stage1_end:
+            stage = "gates"
+        elif self.global_step < self.stage2_end:
+            stage = "gates_queries"
+        else:
+            stage = "full"
+        self._apply_training_stage(stage)
+
+    def _compute_gate_regularizer(self) -> torch.Tensor:
+        if self.config.gate_reg_weight <= 0.0:
+            return torch.tensor(0.0, device=self.device)
+        if not hasattr(self.model, "_gate_values_buffer"):
+            return torch.tensor(0.0, device=self.device)
+
+        gate_values = list(self.model._gate_values_buffer.values())
+        if not gate_values:
+            return torch.tensor(0.0, device=self.device)
+
+        threshold = self.config.gate_saturation_threshold
+        low = 1.0 - threshold
+        penalties = []
+        for g in gate_values:
+            high_penalty = F.relu(g - threshold)
+            low_penalty = F.relu(low - g)
+            penalty = (high_penalty ** 2 + low_penalty ** 2).mean()
+            if self.config.gate_min_std > 0.0:
+                std = g.std()
+                penalty = penalty + F.relu(self.config.gate_min_std - std) ** 2
+            penalties.append(penalty)
+
+        if not penalties:
+            return torch.tensor(0.0, device=self.device)
+        return sum(penalties) / len(penalties)
     
     def train(self):
         """Main training loop."""
@@ -309,9 +425,17 @@ class Trainer:
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 labels=batch["labels"],
+                use_cache=False,
             )
             
             loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
+            gate_reg = self._compute_gate_regularizer()
+            if gate_reg is not None:
+                loss = loss + self.config.gate_reg_weight * gate_reg
+            if not torch.isfinite(loss):
+                logger.error(f"Non-finite loss at step {self.global_step} (epoch {epoch}, batch {step}). Skipping update.")
+                self.optimizer.zero_grad()
+                continue
             loss = loss / self.config.gradient_accumulation_steps
             
             # Backward pass
@@ -333,6 +457,7 @@ class Trainer:
                 self.optimizer.zero_grad()
                 
                 self.global_step += 1
+                self._maybe_update_stage()
                 
                 # Logging
                 if self.global_step % self.config.logging_steps == 0:
@@ -369,6 +494,7 @@ class Trainer:
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 labels=batch["labels"],
+                use_cache=False,
             )
             
             loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
@@ -431,6 +557,25 @@ def main():
     parser.add_argument("--memory_layers", type=int, default=2)
     parser.add_argument("--n_persistent_tokens", type=int, default=16)
     parser.add_argument("--chunk_size", type=int, default=64)
+    parser.add_argument("--attention_window", type=int, default=None,
+                       help="Limit attention to this many previous tokens (forces memory use)")
+    parser.add_argument("--memory_lr", type=float, default=0.01)
+    parser.add_argument("--memory_momentum", type=float, default=0.9)
+    parser.add_argument("--memory_weight_decay", type=float, default=0.01)
+    parser.add_argument("--memory_surprise_threshold", type=float, default=0.0)
+    parser.add_argument("--memory_max_update_norm", type=float, default=1.0)
+    parser.add_argument("--gate_init_bias", type=float, default=-4.0)
+
+    # Gate regularization
+    parser.add_argument("--gate_reg_weight", type=float, default=0.0)
+    parser.add_argument("--gate_saturation_threshold", type=float, default=0.98)
+    parser.add_argument("--gate_min_std", type=float, default=0.0)
+
+    # Staged training
+    parser.add_argument("--stage1_steps", type=int, default=0,
+                       help="Optimization steps for gates-only stage (0 disables)")
+    parser.add_argument("--stage2_steps", type=int, default=0,
+                       help="Optimization steps for gates+queries stage (0 disables)")
     
     # Training
     parser.add_argument("--num_epochs", type=int, default=3)
@@ -465,6 +610,10 @@ def main():
                        help="Which layers to patch: 'all', 'every_N' (e.g. 'every_4'), 'last_N' (e.g. 'last_8'), or comma-separated indices")
     parser.add_argument("--optim_8bit", action="store_true",
                        help="Use 8-bit AdamW optimizer (requires bitsandbytes, saves ~50%% optimizer memory)")
+    parser.add_argument("--load_in_8bit", action="store_true",
+                       help="Load base model in 8-bit (bitsandbytes)")
+    parser.add_argument("--load_in_4bit", action="store_true",
+                       help="Load base model in 4-bit (bitsandbytes)")
     
     args = parser.parse_args()
     
@@ -501,11 +650,21 @@ def main():
         memory_layers=args.memory_layers,
         n_persistent_tokens=args.n_persistent_tokens,
         chunk_size=args.chunk_size,
+        attention_window=args.attention_window,
+        memory_lr=args.memory_lr,
+        memory_momentum=args.memory_momentum,
+        memory_weight_decay=args.memory_weight_decay,
+        memory_learnable_params=True,
+        memory_surprise_threshold=args.memory_surprise_threshold,
+        memory_max_update_norm=args.memory_max_update_norm,
+        gate_init_bias=args.gate_init_bias,
         layers_to_patch=layers_to_patch if isinstance(layers_to_patch, list) else None,
     )
     
     # Load and patch model
     logger.info(f"Loading model: {args.model_name}")
+    if args.load_in_8bit and args.load_in_4bit:
+        raise ValueError("Choose only one of --load_in_8bit or --load_in_4bit")
     
     # If using dynamic layer selection, we need to know n_layers first
     if isinstance(layers_to_patch, tuple):
@@ -526,6 +685,8 @@ def main():
         dtype=dtype,
         gradient_checkpointing=args.gradient_checkpointing,
         attn_implementation=args.attn_implementation,
+        load_in_8bit=args.load_in_8bit,
+        load_in_4bit=args.load_in_4bit,
     )
     
     # Load datasets

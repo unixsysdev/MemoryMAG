@@ -38,6 +38,9 @@ class NeuralMemory(nn.Module):
         lr: Learning rate for memory updates (θ in paper)
         weight_decay: Forgetting factor (α in paper, applied as 1-α)
         learnable_params: Whether η, θ, α are learnable or fixed
+        surprise_threshold: Skip updates when surprise is below this threshold (0 disables)
+        max_update_norm: Clip update gradients by this norm (None disables)
+        update_dtype: Dtype for fast updates (defaults to float32 for stability)
     """
     
     def __init__(
@@ -50,6 +53,9 @@ class NeuralMemory(nn.Module):
         weight_decay: float = 0.01,
         learnable_params: bool = True,
         chunk_size: int = 64,
+        surprise_threshold: float = 0.0,
+        max_update_norm: Optional[float] = None,
+        update_dtype: Optional[torch.dtype] = torch.float32,
     ):
         super().__init__()
         
@@ -57,6 +63,9 @@ class NeuralMemory(nn.Module):
         self.d_memory = d_memory if d_memory is not None else d_model * 2
         self.n_layers = n_layers
         self.chunk_size = chunk_size
+        self.surprise_threshold = surprise_threshold
+        self.max_update_norm = max_update_norm
+        self.update_dtype = update_dtype
         
         # Build the memory MLP layers
         # Structure: d_model -> d_memory -> ... -> d_model
@@ -76,9 +85,14 @@ class NeuralMemory(nn.Module):
         if learnable_params:
             # These will be learned during outer-loop training
             # Using sigmoid to constrain to [0, 1]
-            self.log_momentum = nn.Parameter(torch.tensor(math.log(momentum / (1 - momentum + 1e-8))))
-            self.log_lr = nn.Parameter(torch.tensor(math.log(lr)))
-            self.log_weight_decay = nn.Parameter(torch.tensor(math.log(weight_decay / (1 - weight_decay + 1e-8))))
+            def _safe_logit(value: float, eps: float = 1e-6) -> float:
+                clamped = min(max(value, eps), 1.0 - eps)
+                return math.log(clamped / (1.0 - clamped))
+
+            safe_lr = max(lr, 1e-8)
+            self.log_momentum = nn.Parameter(torch.tensor(_safe_logit(momentum)))
+            self.log_lr = nn.Parameter(torch.tensor(math.log(safe_lr)))
+            self.log_weight_decay = nn.Parameter(torch.tensor(_safe_logit(weight_decay)))
         else:
             self.register_buffer('momentum', torch.tensor(momentum))
             self.register_buffer('lr', torch.tensor(lr))
@@ -183,6 +197,13 @@ class NeuralMemory(nn.Module):
         keys = self.conv_k(self.key_proj(hidden_states).transpose(1, 2))[:, :, :hidden_states.shape[1]].transpose(1, 2)
         values = self.conv_v(self.value_proj(hidden_states).transpose(1, 2))[:, :, :hidden_states.shape[1]].transpose(1, 2)
         
+        if weights is not None:
+            target_dtype = weights[0].dtype
+            if keys.dtype != target_dtype:
+                keys = keys.to(dtype=target_dtype)
+            if values.dtype != target_dtype:
+                values = values.to(dtype=target_dtype)
+
         # Memory reconstruction
         reconstructed = self.memory_forward(keys, weights)
         
@@ -294,7 +315,10 @@ class NeuralMemory(nn.Module):
         dtype = hidden_states.dtype
         
         # Get current memory weights (we'll modify copies for TTT)
-        current_weights = [layer.weight.clone() for layer in self.memory_layers]
+        update_dtype = self.update_dtype if update_memory else hidden_states.dtype
+        if update_dtype is None:
+            update_dtype = hidden_states.dtype
+        current_weights = [layer.weight.to(update_dtype).clone() for layer in self.memory_layers]
         
         # Initialize momentum state if needed
         if self._momentum_state is None or self._momentum_state[0].shape != current_weights[0].shape:
@@ -307,35 +331,54 @@ class NeuralMemory(nn.Module):
         for chunk_start in range(0, seq_len, self.chunk_size):
             chunk_end = min(chunk_start + self.chunk_size, seq_len)
             chunk = hidden_states[:, chunk_start:chunk_end, :]
+            proj_chunk = chunk
+            proj_dtype = self.key_proj.weight.dtype
+            if proj_chunk.dtype != proj_dtype:
+                proj_chunk = proj_chunk.to(dtype=proj_dtype)
             
             if update_memory:
                 # Compute surprise and gradients for this chunk
-                surprise, keys, values = self.compute_surprise(chunk, current_weights)
+                surprise, keys, values = self.compute_surprise(proj_chunk, current_weights)
                 
                 if return_surprise:
-                    surprises.append(surprise.mean(dim=-1))
-                
-                # Compute weight gradients
-                grads = self.compute_weight_gradients(keys, values, current_weights)
-                
-                # Update weights with momentum and weight decay
-                # S_t = η * S_{t-1} - θ * ∇L (momentum update)
-                # M_t = (1 - α) * M_{t-1} + S_t (weight decay + gradient)
-                eta = self.eta
-                theta = self.theta
-                alpha = self.alpha
-                
-                for i, (w, g, s) in enumerate(zip(current_weights, grads, self._momentum_state)):
-                    # Update momentum
-                    s_new = eta * s - theta * g
-                    self._momentum_state[i] = s_new
+                    surprises.append(torch.nan_to_num(surprise.mean(dim=-1), nan=0.0, posinf=0.0, neginf=0.0))
+
+                do_update = True
+                if self.surprise_threshold and surprise.mean().item() < self.surprise_threshold:
+                    do_update = False
+
+                if do_update:
+                    with torch.no_grad():
+                        # Compute weight gradients
+                        grads = self.compute_weight_gradients(keys, values, current_weights)
                     
-                    # Update weights with decay
-                    current_weights[i] = (1 - alpha) * w + s_new
+                        # Update weights with momentum and weight decay
+                        # S_t = η * S_{t-1} - θ * ∇L (momentum update)
+                        # M_t = (1 - α) * M_{t-1} + S_t (weight decay + gradient)
+                        eta = self.eta
+                        theta = self.theta
+                        alpha = self.alpha
+                        
+                        for i, (w, g, s) in enumerate(zip(current_weights, grads, self._momentum_state)):
+                            g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+                            if self.max_update_norm is not None:
+                                grad_norm = torch.linalg.vector_norm(g)
+                                if torch.isfinite(grad_norm) and grad_norm > self.max_update_norm:
+                                    g = g * (self.max_update_norm / (grad_norm + 1e-6))
+                            # Update momentum
+                            s_new = eta * s - theta * g
+                            s_new = torch.nan_to_num(s_new, nan=0.0, posinf=0.0, neginf=0.0)
+                            self._momentum_state[i] = s_new
+                            
+                            # Update weights with decay
+                            current_weights[i] = (1 - alpha) * w + s_new
             
             # Retrieve using updated weights
-            q = self.conv_q(self.query_proj(chunk).transpose(1, 2))[:, :, :chunk.shape[1]].transpose(1, 2)
+            q = self.conv_q(self.query_proj(proj_chunk).transpose(1, 2))[:, :, :proj_chunk.shape[1]].transpose(1, 2)
+            if q.dtype != current_weights[0].dtype:
+                q = q.to(dtype=current_weights[0].dtype)
             output = self.memory_forward(q, current_weights)
+            output = torch.nan_to_num(output, nan=0.0, posinf=0.0, neginf=0.0)
             outputs.append(output)
         
         output = torch.cat(outputs, dim=1).to(dtype=dtype)
@@ -346,9 +389,14 @@ class NeuralMemory(nn.Module):
         
         return output, None
     
-    def reset_memory(self):
-        """Reset memory to initial state (call between sequences)."""
+    def reset_memory(self, reset_weights: bool = False):
+        """Reset fast memory state (call between sequences)."""
         self._momentum_state = None
+        if reset_weights:
+            self._init_identity_like()
+
+    def reinit_memory(self):
+        """Reinitialize memory weights to the identity-like default."""
         self._init_identity_like()
 
 

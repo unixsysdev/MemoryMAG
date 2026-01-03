@@ -34,7 +34,14 @@ class Qwen3MAGConfig:
         d_memory: Optional[int] = None,
         memory_layers: int = 2,
         chunk_size: int = 64,
-        gate_init_bias: float = -2.0,
+        attention_window: Optional[int] = None,
+        memory_lr: float = 0.01,
+        memory_momentum: float = 0.9,
+        memory_weight_decay: float = 0.01,
+        memory_learnable_params: bool = True,
+        memory_surprise_threshold: float = 0.0,
+        memory_max_update_norm: Optional[float] = 1.0,
+        gate_init_bias: float = -4.0,
         n_persistent_tokens: int = 16,
         layers_to_patch: Optional[List[int]] = None,
         query_combine_mode: str = 'gate',
@@ -44,6 +51,13 @@ class Qwen3MAGConfig:
         self.d_memory = d_memory
         self.memory_layers = memory_layers
         self.chunk_size = chunk_size
+        self.attention_window = attention_window
+        self.memory_lr = memory_lr
+        self.memory_momentum = memory_momentum
+        self.memory_weight_decay = memory_weight_decay
+        self.memory_learnable_params = memory_learnable_params
+        self.memory_surprise_threshold = memory_surprise_threshold
+        self.memory_max_update_norm = memory_max_update_norm
         self.gate_init_bias = gate_init_bias
         self.n_persistent_tokens = n_persistent_tokens
         self.layers_to_patch = layers_to_patch
@@ -100,7 +114,13 @@ class Qwen3MAGDecoderLayer(nn.Module):
             d_model=d_model,
             d_memory=d_memory,
             n_layers=config.memory_layers,
+            momentum=config.memory_momentum,
+            lr=config.memory_lr,
+            weight_decay=config.memory_weight_decay,
+            learnable_params=config.memory_learnable_params,
             chunk_size=config.chunk_size,
+            surprise_threshold=config.memory_surprise_threshold,
+            max_update_norm=config.memory_max_update_norm,
         )
         
         self.query_projector = QueryProjector(
@@ -130,6 +150,18 @@ class Qwen3MAGDecoderLayer(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ):
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+        base_dtype = hidden_states.dtype
+        for p in self.self_attn.parameters():
+            if p.is_floating_point():
+                base_dtype = p.dtype
+                break
+        if base_dtype == hidden_states.dtype:
+            for p in self.mlp.parameters():
+                if p.is_floating_point():
+                    base_dtype = p.dtype
+                    break
         # Get previous layer's LTM output from shared buffer (if available)
         prev_ltm_out = None
         if self.parent_model is not None and self.layer_idx > 0:
@@ -139,7 +171,7 @@ class Qwen3MAGDecoderLayer(nn.Module):
                     prev_ltm_out = self.parent_model._ltm_buffer[prev_idx]
                     break
         
-        dtype = hidden_states.dtype
+        dtype = base_dtype
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         
@@ -154,16 +186,22 @@ class Qwen3MAGDecoderLayer(nn.Module):
             cache_position=cache_position,
             **kwargs,
         )
-        
+
         if isinstance(attn_outputs, tuple):
             attn_out = attn_outputs[0]
         else:
             attn_out = attn_outputs
+        attn_out = torch.nan_to_num(attn_out, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Memory path (trainable) - ensure dtype consistency
         query = self.query_projector(hidden_states, prev_ltm_out)
         ltm_out, _ = self.neural_memory(query, update_memory=True, return_surprise=True)
-        ltm_out = self.memory_norm(ltm_out).to(dtype=dtype)
+        norm_dtype = self.memory_norm.weight.dtype
+        if ltm_out.dtype != norm_dtype:
+            ltm_out = ltm_out.to(dtype=norm_dtype)
+        ltm_out = self.memory_norm(ltm_out)
+        ltm_out = torch.nan_to_num(ltm_out, nan=0.0, posinf=0.0, neginf=0.0)
+        ltm_out = ltm_out.to(dtype=dtype)
         
         # Store LTM output in shared buffer for next MAG layer
         if self.parent_model is not None:
@@ -182,10 +220,9 @@ class Qwen3MAGDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        
-        # Return just hidden_states tensor (same as original Qwen3DecoderLayer)
-        # The Qwen3 model loop does: hidden_states = decoder_layer(hidden_states, ...)
-        # It expects a tensor, not a tuple
+        if hidden_states.dtype != base_dtype:
+            hidden_states = hidden_states.to(dtype=base_dtype)
+
         return hidden_states
     
     def reset_memory(self):
@@ -195,11 +232,18 @@ class Qwen3MAGDecoderLayer(nn.Module):
 class Qwen3MAGModel(nn.Module):
     """Complete Qwen3 model with MAG augmentation."""
     
-    def __init__(self, base_model: nn.Module, config: Qwen3MAGConfig, gradient_checkpointing: bool = False):
+    def __init__(
+        self,
+        base_model: nn.Module,
+        config: Qwen3MAGConfig,
+        gradient_checkpointing: bool = False,
+        mag_dtype: Optional[torch.dtype] = None,
+    ):
         super().__init__()
         
         self.base_model = base_model
         self.mag_config = config
+        self.mag_dtype = mag_dtype
         self.model_config = base_model.config
         self.d_model = self.model_config.hidden_size
         self.n_layers = self.model_config.num_hidden_layers
@@ -236,8 +280,8 @@ class Qwen3MAGModel(nn.Module):
         else:
             decoder_layers = self.base_model.layers
         
-        # Get dtype from base model
-        dtype = next(self.base_model.parameters()).dtype
+        # Get dtype/device for MAG layers
+        dtype = self.mag_dtype if self.mag_dtype is not None else next(self.base_model.parameters()).dtype
         device = next(self.base_model.parameters()).device
         
         self.mag_layers = nn.ModuleList()
@@ -259,6 +303,29 @@ class Qwen3MAGModel(nn.Module):
                 decoder_layers[idx] = mag_layer
             else:
                 self.mag_layers.append(None)
+
+    def _build_attention_window_mask(
+        self,
+        attention_mask: Optional[torch.Tensor],
+        seq_len: int,
+        window: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        idx = torch.arange(seq_len, device=device)
+        i = idx[:, None]
+        j = idx[None, :]
+        window_start = i - (window - 1)
+        allowed = (j <= i) & (j >= window_start)
+        if attention_mask is not None:
+            src_mask = attention_mask[:, None, None, :].bool()
+            allowed = allowed[None, None, :, :].expand(attention_mask.size(0), -1, -1, -1)
+            allowed = allowed & src_mask
+        else:
+            allowed = allowed[None, None, :, :]
+        attn_mask = torch.zeros_like(allowed, dtype=dtype)
+        attn_mask = attn_mask.masked_fill(~allowed, torch.finfo(dtype).min)
+        return attn_mask
     
     def _freeze_base_components(self):
         if self.mag_config.freeze_embeddings:
@@ -302,8 +369,37 @@ class Qwen3MAGModel(nn.Module):
                     device=attention_mask.device, dtype=attention_mask.dtype
                 )
                 attention_mask = torch.cat([persistent_mask, attention_mask], dim=1)
+
+            if position_ids is not None:
+                if position_ids.dim() == 1:
+                    position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+                persistent_positions = torch.arange(
+                    self.mag_config.n_persistent_tokens,
+                    device=position_ids.device,
+                    dtype=position_ids.dtype,
+                ).unsqueeze(0).expand(batch_size, -1)
+                position_ids = torch.cat(
+                    [persistent_positions, position_ids + self.mag_config.n_persistent_tokens],
+                    dim=1,
+                )
+
+        if self.mag_config.attention_window is not None:
+            attention_mask = self._build_attention_window_mask(
+                attention_mask=attention_mask,
+                seq_len=inputs_embeds.shape[1],
+                window=self.mag_config.attention_window,
+                dtype=inputs_embeds.dtype,
+                device=inputs_embeds.device,
+            )
         
-        outputs = self.base_model(
+        target_dtype = inputs_embeds.dtype
+        lm_weight = getattr(self.base_model.lm_head, "weight", None)
+        if lm_weight is not None and lm_weight.is_floating_point():
+            target_dtype = lm_weight.dtype
+        if inputs_embeds.dtype != target_dtype:
+            inputs_embeds = inputs_embeds.to(dtype=target_dtype)
+
+        base_outputs = self.base_model.model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -311,24 +407,138 @@ class Qwen3MAGModel(nn.Module):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            return_dict=True,
             **kwargs,
         )
+
+        hidden_states = base_outputs[0]
+        hidden_states = torch.nan_to_num(hidden_states, nan=0.0, posinf=0.0, neginf=0.0)
+        lm_weight = getattr(self.base_model.lm_head, "weight", None)
+        lm_dtype = lm_weight.dtype if lm_weight is not None and lm_weight.is_floating_point() else hidden_states.dtype
+        hidden_states_for_lm = hidden_states if hidden_states.dtype == lm_dtype else hidden_states.to(dtype=lm_dtype)
+        logits = self.base_model.lm_head(hidden_states_for_lm)
         
-        if self.persistent_memory is not None and hasattr(outputs, 'logits'):
-            outputs.logits = outputs.logits[:, self.mag_config.n_persistent_tokens:, :]
+        if self.persistent_memory is not None and logits is not None:
+            logits = logits[:, self.mag_config.n_persistent_tokens:, :]
         
-        if labels is not None:
-            logits = outputs.logits if hasattr(outputs, 'logits') else outputs[0]
-            shift_logits = logits[..., :-1, :].contiguous()
+        loss = None
+        if labels is not None and logits is not None:
+            shift_logits = logits[..., :-1, :].contiguous().float()
             shift_labels = labels[..., 1:].contiguous()
             loss = nn.CrossEntropyLoss()(
                 shift_logits.view(-1, self.vocab_size),
                 shift_labels.view(-1)
             )
-            if hasattr(outputs, 'loss'):
-                outputs.loss = loss
-        
+
+        if return_dict is None:
+            return_dict = getattr(self.base_model.config, "use_return_dict", True)
+
+        if return_dict:
+            from transformers.modeling_outputs import CausalLMOutputWithPast
+            return CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=base_outputs.past_key_values,
+                hidden_states=base_outputs.hidden_states,
+                attentions=base_outputs.attentions,
+            )
+
+        outputs = (logits, base_outputs.past_key_values, base_outputs.hidden_states, base_outputs.attentions)
+        return (loss,) + outputs if loss is not None else outputs
+
+    def _strip_persistent_from_generate(self, outputs):
+        if self.mag_config.n_persistent_tokens <= 0:
+            return outputs
+        prefix = self.mag_config.n_persistent_tokens
+        if isinstance(outputs, torch.Tensor):
+            return outputs[:, prefix:]
+        if hasattr(outputs, "sequences"):
+            outputs.sequences = outputs.sequences[:, prefix:]
+        return outputs
+
+    def _restore_input_ids_in_generate(self, outputs, input_ids):
+        if input_ids is None:
+            return outputs
+        if isinstance(outputs, torch.Tensor):
+            if outputs.shape[1] >= input_ids.shape[1]:
+                outputs[:, :input_ids.shape[1]] = input_ids.to(outputs.device)
+            return outputs
+        if hasattr(outputs, "sequences"):
+            sequences = outputs.sequences
+            if sequences.shape[1] >= input_ids.shape[1]:
+                sequences[:, :input_ids.shape[1]] = input_ids.to(sequences.device)
+            outputs.sequences = sequences
+        return outputs
+
+    def generate(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        **kwargs,
+    ):
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("generate requires input_ids or inputs_embeds")
+            if self.persistent_memory is None:
+                if position_ids is not None:
+                    kwargs["position_ids"] = position_ids
+                return self.base_model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    **kwargs,
+                )
+            embed = self.base_model.model.embed_tokens if hasattr(self.base_model, 'model') else self.base_model.embed_tokens
+            inputs_embeds = embed(input_ids)
+
+        batch_size, _, _ = inputs_embeds.shape
+        dtype = inputs_embeds.dtype
+
+        if self.persistent_memory is not None:
+            persistent = self.persistent_memory.to(dtype=dtype).expand(batch_size, -1, -1)
+            inputs_embeds = torch.cat([persistent, inputs_embeds], dim=1)
+
+            if attention_mask is not None:
+                persistent_mask = torch.ones(
+                    batch_size, self.mag_config.n_persistent_tokens,
+                    device=attention_mask.device, dtype=attention_mask.dtype
+                )
+                attention_mask = torch.cat([persistent_mask, attention_mask], dim=1)
+
+            if position_ids is not None:
+                if position_ids.dim() == 1:
+                    position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+                persistent_positions = torch.arange(
+                    self.mag_config.n_persistent_tokens,
+                    device=position_ids.device,
+                    dtype=position_ids.dtype,
+                ).unsqueeze(0).expand(batch_size, -1)
+                position_ids = torch.cat(
+                    [persistent_positions, position_ids + self.mag_config.n_persistent_tokens],
+                    dim=1,
+                )
+
+        lm_weight = getattr(self.base_model.lm_head, "weight", None)
+        target_dtype = inputs_embeds.dtype
+        if lm_weight is not None and lm_weight.is_floating_point():
+            target_dtype = lm_weight.dtype
+        if inputs_embeds.dtype != target_dtype:
+            inputs_embeds = inputs_embeds.to(dtype=target_dtype)
+
+        if position_ids is not None:
+            kwargs["position_ids"] = position_ids
+
+        outputs = self.base_model.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+
+        if self.persistent_memory is not None:
+            outputs = self._strip_persistent_from_generate(outputs)
+            outputs = self._restore_input_ids_in_generate(outputs, input_ids)
+
         return outputs
     
     def reset_all_memory(self):
@@ -364,6 +574,8 @@ def patch_qwen3_with_mag(
     dtype: torch.dtype = torch.bfloat16,
     gradient_checkpointing: bool = False,
     attn_implementation: str = "eager",
+    load_in_8bit: bool = False,
+    load_in_4bit: bool = False,
 ) -> Qwen3MAGModel:
     """Load Qwen3 and patch with MAG components.
     
@@ -384,16 +596,34 @@ def patch_qwen3_with_mag(
     logger.info(f"Loading base model: {model_name_or_path}")
     logger.info(f"Using attention implementation: {attn_implementation}")
     
+    quantization_config = None
+    if load_in_8bit or load_in_4bit:
+        try:
+            from transformers import BitsAndBytesConfig
+        except Exception as exc:
+            raise RuntimeError("bitsandbytes/transformers quantization not available") from exc
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=load_in_8bit,
+            load_in_4bit=load_in_4bit,
+            bnb_4bit_compute_dtype=dtype if load_in_4bit else None,
+        )
+
     base_model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
         torch_dtype=dtype,
         device_map=device,
         attn_implementation=attn_implementation,
+        quantization_config=quantization_config,
     )
     
     logger.info(f"Base model params: {sum(p.numel() for p in base_model.parameters()):,}")
     
-    mag_model = Qwen3MAGModel(base_model, config, gradient_checkpointing=gradient_checkpointing)
+    mag_model = Qwen3MAGModel(
+        base_model,
+        config,
+        gradient_checkpointing=gradient_checkpointing,
+        mag_dtype=dtype,
+    )
     
     trainable = mag_model.count_trainable_parameters()
     total = sum(p.numel() for p in mag_model.parameters())
